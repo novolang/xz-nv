@@ -1,0 +1,234 @@
+// xzindex.nv — the table of contents at the back of every `.xz` file,
+// and the reason `.xz` can be seeked and `.gz` cannot.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE INDEX IS WHY THE FORMAT PUTS ITS METADATA AT THE END.  A reader
+// that can seek takes the last twelve bytes, reads the footer's
+// backward size, jumps that far back, and has one record per block —
+// each carrying the block's compressed size and its uncompressed size.
+// Summing the uncompressed sizes gives the file's total decompressed
+// length without touching a compressed byte, and the running sum gives
+// the block a given output offset falls in.  That is the whole basis
+// of `pixz`, of random access into a multi-gigabyte archive, and of
+// `xz --list` printing a table in constant time.
+//
+// A RECORD IS TWO NUMBERS AND NEITHER IS THE OBVIOUS ONE.  The first
+// is the block's UNPADDED size: the header plus the compressed data
+// plus the check, WITHOUT the block padding.  The second is the
+// uncompressed size.  The padding is left out because it is derivable,
+// and the format declines to store what it can compute — which means a
+// reader walking the index has to add the padding back to get a byte
+// offset, and `offsets_of` is the call that does it so nobody writes
+// that loop twice.
+//
+// AND THE INDEX IS CHECKED AGAINST THE BLOCKS.  A decoder that read
+// every block and then ignored the index would accept a file whose
+// table of contents lies, which is the whole point of having one.
+// `agrees_with` is the comparison, and it catches a count, a size and
+// an order that a per-block check cannot.
+
+use xzerror
+
+// The byte that introduces the index: `0x00`.
+//
+// The same byte that would have been a block header's size, which is
+// what lets a decoder tell "another block" from "the table of
+// contents" with no look-ahead.
+pub const XZ_INDEX_INDICATOR_BYTE = 0x00
+
+// One index record: a block's unpadded size and its uncompressed size.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${xzindex.record(116, 65536).uncompressed}")
+// ```
+pub struct XzIndexRecord
+    // The block's header plus compressed data plus check, WITHOUT the
+    // block padding.  Not the obvious number, and the one the format
+    // stores.
+    unpadded: Int
+    // The block's uncompressed size.
+    uncompressed: Int
+
+// A record from its two numbers.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${xzindex.record(116, 65536).unpadded}")
+// ```
+pub fn record(unpadded: Int, uncompressed: Int) -> XzIndexRecord []
+    todo("xz-nv.xzindex.record")
+
+// A stream's whole index.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${xzindex.index([]).records}")
+// ```
+pub struct XzIndex
+    // One record per block, in the order the blocks appear.
+    records: [XzIndexRecord]
+
+// An index from its records.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${xzindex.block_count(xzindex.index([]))}")
+// ```
+pub fn index(records: [XzIndexRecord]) -> XzIndex []
+    todo("xz-nv.xzindex.index")
+
+// Read an index from `src` at `off`.
+//
+// Every fault here is damage rather than a bound, so
+// `xzerror.is_corrupt` answers true for all of them.
+//
+// `XzBadVli` for a record count or a size that is not a canonical
+// variable-length integer, `XzIndexMismatch` for a record count that
+// does not match the records that follow, and `XzHeaderCrcMismatch`
+// for a damaged index — the index checksums itself, like the two
+// headers.
+//
+// ```novo
+// use std.bytes
+// use xzindex
+//
+// fn main() [io]
+//     match xzindex.read(bytes.zeros(8), 0)
+//         Ok(i)  => println("${xzindex.block_count(i)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn read(src: Bytes, off: Int) -> Result<XzIndex, XzFault> []
+    todo("xz-nv.xzindex.read")
+
+// The bytes an index encodes to, padded to a multiple of four and
+// checksummed.
+//
+// ```novo
+// use std.bytes
+// use xzindex
+//
+// fn main() [io]
+//     match xzindex.encode(xzindex.index([]))
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn encode(i: XzIndex) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzindex.encode")
+
+// How many blocks the index describes.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${xzindex.block_count(xzindex.index([]))}")
+// ```
+pub fn block_count(i: XzIndex) -> Int []
+    todo("xz-nv.xzindex.block_count")
+
+// The file's total uncompressed size, from the index alone.
+//
+// THE CALL `xz --list` IS MADE OF, and the reason it answers in
+// constant time on a forty-gigabyte archive.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${xzindex.total_uncompressed(xzindex.index([]))}")
+// ```
+pub fn total_uncompressed(i: XzIndex) -> Int []
+    todo("xz-nv.xzindex.total_uncompressed")
+
+// The file's total compressed size, from the index alone: the sum of
+// the unpadded sizes with each block's padding added back.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${xzindex.total_compressed(xzindex.index([]))}")
+// ```
+pub fn total_compressed(i: XzIndex) -> Int []
+    todo("xz-nv.xzindex.total_compressed")
+
+// How many bytes an index of `n` records occupies, before its padding.
+//
+// The number the stream footer's backward-size field has to agree
+// with, and the number a writer sizes a buffer from.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     match xzindex.encoded_bytes(xzindex.index([]))
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn encoded_bytes(i: XzIndex) -> Result<Int, XzFault> []
+    todo("xz-nv.xzindex.encoded_bytes")
+
+// Where each block starts, in compressed bytes from the stream's first
+// byte.
+//
+// The padding added back, once, here — because the index stores
+// unpadded sizes and every reader that wanted a byte offset would
+// otherwise write the same loop, and one of them would get it wrong.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${list.len(xzindex.offsets_of(xzindex.index([])))}")
+// ```
+pub fn offsets_of(i: XzIndex) -> [Int] []
+    todo("xz-nv.xzindex.offsets_of")
+
+// Which block a given uncompressed offset falls in, or `-1` past the
+// end.
+//
+// THE RANDOM-ACCESS CALL.  A reader that wants byte 3,000,000,000 of a
+// decompressed archive asks this, seeks to `offsets_of` at that index,
+// and decodes one block instead of three gigabytes.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     println("${xzindex.block_at(xzindex.index([]), 0)}")
+// ```
+pub fn block_at(i: XzIndex, uncompressed_offset: Int) -> Int []
+    todo("xz-nv.xzindex.block_at")
+
+// Whether an index agrees with the blocks a decoder actually read.
+//
+// `XzIndexMismatch` naming what disagreed: the count, a record's
+// unpadded size, or a record's uncompressed size.
+//
+// THE CHECK A PER-BLOCK CHECKSUM CANNOT MAKE.  Every block's integrity
+// check can pass and this still fail, because the index also fixes the
+// ORDER and the COUNT of the blocks — so a file whose blocks were
+// reordered, or one of whose blocks was dropped, is caught here and
+// nowhere else.
+//
+// ```novo
+// use xzindex
+//
+// fn main() [io]
+//     match xzindex.agrees_with(xzindex.index([]), [])
+//         Ok(_)  => println("an empty index agrees with no blocks")
+//         Err(e) => println(e.message())
+// ```
+pub fn agrees_with(i: XzIndex, read_records: [XzIndexRecord]) -> Result<Int, XzFault> []
+    todo("xz-nv.xzindex.agrees_with")

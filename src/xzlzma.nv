@@ -1,0 +1,549 @@
+// xzlzma.nv — LZMA1: the properties byte, the twelve-state machine,
+// the length and distance codes, and the legacy `.lzma` container.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// LZMA IS LZ77 WITH AN ADAPTIVE CONTEXT MODEL.  The output is a
+// sequence of literals and matches, exactly as in DEFLATE; what
+// differs is that every decision is a range-coded bit whose probability
+// depends on a CONTEXT, and the contexts are chosen with care:
+//
+//   lc  how many of the previous byte's high bits select the literal
+//       model.  Three by default, so a literal after `e` is coded
+//       against a different table from a literal after a space.
+//   lp  how many of the output position's low bits select it.  Zero by
+//       default, and two suits 32-bit-aligned binary data.
+//   pb  how many of the position's low bits select the match models.
+//       Two by default.
+//
+// `lc + lp` MAY NOT EXCEED FOUR, because the literal model is
+// `0x300 << (lc + lp)` probabilities and the format fixes the ceiling.
+// A properties byte encoding more is `XzBadLzmaProperties`, and this is
+// the first thing a decoder checks — before it has sized anything.
+//
+// THE TWELVE-STATE MACHINE IS THE OTHER HALF OF THE CONTEXT.  The
+// decoder remembers what the last three symbols were, coarsely: a
+// literal after a match is coded differently from a literal after a
+// literal, because a literal that interrupts a run of matches is far
+// more likely to be the start of a new region.  `next_state_*` is that
+// machine, published as four functions rather than a table, because the
+// table is what a port transcribes wrongly.
+//
+// THE FOUR REP DISTANCES ARE WHERE THE RATIO IS.  LZMA keeps the last
+// four match distances and can name one instead of coding a new
+// distance, which costs a handful of bits rather than thirty.  A file
+// with a repeating structure — a column of a table, a record format —
+// is mostly rep matches.
+//
+// THE LEGACY `.lzma` CONTAINER IS THIRTEEN BYTES AND HAS NO CHECKSUM.
+// One properties byte, four bytes of dictionary size, eight bytes of
+// uncompressed size where `0xFFFFFFFFFFFFFFFF` means unknown.  No
+// magic, no integrity check, no end marker unless the size is unknown.
+// It is read here because files exist; nothing writes it.
+
+use xzerror
+use xzrange
+
+// The most `lc + lp` may be: 4.
+pub const XZ_LCLP_MOST = 4
+
+// The default literal-context bits: 3.
+pub const XZ_LC_DEFAULT = 3
+
+// The default literal-position bits: 0.
+pub const XZ_LP_DEFAULT = 0
+
+// The default position bits: 2.
+pub const XZ_PB_DEFAULT = 2
+
+// How many states the machine has: 12.
+pub const XZ_STATES = 12
+
+// The shortest match LZMA can code: 2.
+pub const XZ_MATCH_LEN_LEAST = 2
+
+// The longest match LZMA can code: 273.
+pub const XZ_MATCH_LEN_MOST = 273
+
+// How many distance slots there are: 64.
+pub const XZ_DIST_SLOTS = 64
+
+// The distance that means "end of stream": `0xFFFFFFFF`.
+//
+// The end marker, which a `.lzma` file with an unknown size must
+// carry and an LZMA2 chunk never does — LZMA2 carries its sizes
+// instead, which is one of the two reasons it exists.
+pub const XZ_END_MARKER_DISTANCE = 0xFFFFFFFF
+
+// The thirteen-byte legacy `.lzma` header's size.
+pub const XZ_LZMA_ALONE_HEADER_BYTES = 13
+
+// The size field value that means "the uncompressed size is unknown":
+// `0xFFFFFFFFFFFFFFFF`.
+pub const XZ_SIZE_UNKNOWN = -1
+
+// LZMA's three context parameters, decoded from one properties byte.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.properties(0x5D)
+//         Ok(p)  => println("${p.lc} ${p.lp} ${p.pb}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzLzmaProps
+    // Literal context bits, `0` ..= `4`.
+    lc: Int
+    // Literal position bits, `0` ..= `4`.
+    lp: Int
+    // Position bits, `0` ..= `4`.
+    pb: Int
+
+// Decode a properties byte: `(pb * 5 + lp) * 9 + lc`.
+//
+// `XzBadLzmaProperties` above 224, and for any byte whose `lc + lp`
+// exceeds four.  `xzerror.is_corrupt` answers true for it.  THE FIRST CHECK A DECODER MAKES, before it has sized
+// a probability array — because the array's size is a function of
+// exactly these numbers.
+//
+// `0x5D` is `lc = 3, lp = 0, pb = 2`, which is what every `xz` and
+// every `lzma` writes unless told otherwise.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.properties(0x5D)
+//         Ok(p)  => println("${p.lc}")
+//         Err(e) => println(e.message())
+// ```
+pub fn properties(b: Int) -> Result<XzLzmaProps, XzFault> []
+    todo("xz-nv.xzlzma.properties")
+
+// The properties byte a set of parameters encodes to.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.properties_byte(3, 0, 2)
+//         Ok(b)  => println("${b}")
+//         Err(e) => println(e.message())
+// ```
+pub fn properties_byte(lc: Int, lp: Int, pb: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzlzma.properties_byte")
+
+// How many probabilities a model with these parameters needs.
+//
+// The literal model is `0x300 << (lc + lp)` and the rest is fixed, so
+// the default `lc = 3, lp = 0` is 14,134 probabilities and
+// `lc = 4, lp = 0` is twice the literal half.
+//
+// THE CALL A CALLER SIZES THE MODEL WITH.  This package allocates no
+// probability array: `xzrange.decode_bit` takes one value and answers
+// the updated one, and the array is the caller's from end to end.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.properties(0x5D)
+//         Ok(p)  => println("${xzlzma.probability_count(p)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn probability_count(p: XzLzmaProps) -> Int []
+    todo("xz-nv.xzlzma.probability_count")
+
+// How many bytes a probability array of `n` entries occupies.
+//
+// Two per probability: an 11-bit value fits in sixteen bits, and a
+// 14,134-entry model is therefore 28 KiB rather than 113 KiB of
+// 64-bit words.  The distinction is what decides whether an LZMA
+// decoder fits anywhere small.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.probability_bytes(14134)}")
+// ```
+pub fn probability_bytes(n: Int) -> Int []
+    todo("xz-nv.xzlzma.probability_bytes")
+
+// Set every probability in a caller's array to `XZ_PROB_INIT`.
+//
+// What a state reset does.  Answers the array.  `XzBufferTooSmall`
+// when it is shorter than `probability_bytes(n)`.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.reset_probabilities(bytes.zeros(64), 32)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn reset_probabilities(probs: Bytes, n: Int) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzlzma.reset_probabilities")
+
+// The state after a literal.
+//
+// Four functions rather than one table, because the table is what a
+// port transcribes wrongly and a function can be tested one arm at a
+// time.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.next_state_literal(0)}")
+// ```
+pub fn next_state_literal(state: Int) -> Int []
+    todo("xz-nv.xzlzma.next_state_literal")
+
+// The state after a new-distance match.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.next_state_match(0)}")
+// ```
+pub fn next_state_match(state: Int) -> Int []
+    todo("xz-nv.xzlzma.next_state_match")
+
+// The state after a rep match — one that names a remembered distance.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.next_state_rep(0)}")
+// ```
+pub fn next_state_rep(state: Int) -> Int []
+    todo("xz-nv.xzlzma.next_state_rep")
+
+// The state after a short rep — a single byte at the last distance.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.next_state_short_rep(0)}")
+// ```
+pub fn next_state_short_rep(state: Int) -> Int []
+    todo("xz-nv.xzlzma.next_state_short_rep")
+
+// Whether a state means the last symbol was a literal.
+//
+// The predicate the match models are selected by: `state < 7`.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.state_is_literal(0)}")
+// ```
+pub fn state_is_literal(state: Int) -> Bool []
+    todo("xz-nv.xzlzma.state_is_literal")
+
+// The four remembered match distances.
+//
+// A `@value` struct: four integers the symbol loop carries in
+// registers.
+pub @value
+struct XzRepDistances
+    // The most recent distance, which a short rep names.
+    r0: Int
+    // The second most recent.
+    r1: Int
+    // The third.
+    r2: Int
+    // The fourth.
+    r3: Int
+
+// Four distances with nothing remembered yet.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.reps_start().r0}")
+// ```
+pub fn reps_start() -> XzRepDistances []
+    todo("xz-nv.xzlzma.reps_start")
+
+// Push a new distance to the front, dropping the oldest.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.reps_push(xzlzma.reps_start(), 17).r0}")
+// ```
+pub fn reps_push(r: XzRepDistances, distance: Int) -> XzRepDistances []
+    todo("xz-nv.xzlzma.reps_push")
+
+// Move the distance at index `i` to the front, as a rep match does.
+//
+// `i` is `0` ..= `3`; index 0 leaves the list alone, which is what a
+// short rep does.  WHERE THE RATIO IS: naming one of four remembered
+// distances costs a handful of bits where a new distance costs thirty,
+// and a file with a repeating record structure is mostly this.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.reps_use(xzlzma.reps_start(), 2).r0}")
+// ```
+pub fn reps_use(r: XzRepDistances, i: Int) -> XzRepDistances []
+    todo("xz-nv.xzlzma.reps_use")
+
+// The distance at index `i` of the remembered four.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     println("${xzlzma.reps_at(xzlzma.reps_start(), 0)}")
+// ```
+pub fn reps_at(r: XzRepDistances, i: Int) -> Int []
+    todo("xz-nv.xzlzma.reps_at")
+
+// How many direct bits a distance slot carries after its two high
+// bits.
+//
+// A distance is coded as a six-bit slot and then that many more bits;
+// slots 0 to 3 are the distance itself, and from slot 4 up the slot
+// names a power of two and the extra bits name the offset inside it.
+//
+// `XzBadParameter` for a slot outside `0` ..= `63`.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.slot_extra_bits(14)
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn slot_extra_bits(slot: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzlzma.slot_extra_bits")
+
+// The base distance a slot starts at.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.slot_base(14)
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn slot_base(slot: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzlzma.slot_base")
+
+// Whether a distance can be used, given how much output exists and how
+// large the dictionary is.
+//
+// THE CHECK THAT MAKES THE DECODER SAFE.  A match reads from the
+// output at `produced - distance`; without this it reads whatever is
+// in front of the buffer and hands it back as plaintext.
+// `XzDistanceTooFar` carrying both numbers.
+//
+// ```novo
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.check_distance(4, 16, 65536)
+//         Ok(_)  => println("inside the output produced so far")
+//         Err(e) => println(e.message())
+// ```
+pub fn check_distance(distance: Int, produced: Int, dict_bytes: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzlzma.check_distance")
+
+// The legacy `.lzma` container's thirteen-byte header.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.read_alone_header(bytes.zeros(13))
+//         Ok(h)  => println("${h.dict_bytes}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzAloneHeader
+    // The three context parameters.
+    props: XzLzmaProps
+    // The dictionary size, in bytes, as the four-byte field says.
+    dict_bytes: Int
+    // The uncompressed size, or `XZ_SIZE_UNKNOWN` when the eight-byte
+    // field is all ones.  Unknown means the stream ends with an end
+    // marker instead.
+    uncompressed_size: Int
+
+// Read the legacy `.lzma` header from the first thirteen bytes of
+// `src`.
+//
+// `XzBadLzmaProperties` for a properties byte the format does not
+// allow, and `XzBadParameter` for a dictionary size of zero.
+//
+// THERE IS NO MAGIC AND NO CHECKSUM, which is worth knowing before
+// trusting the result: a `.lzma` file cannot be recognised by
+// inspection, and a damaged one is not detectable at all.  `.xz` was
+// created to fix both, and a caller with a choice should read `.xz`.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.read_alone_header(bytes.zeros(13))
+//         Ok(h)  => println("${h.uncompressed_size}")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_alone_header(src: Bytes) -> Result<XzAloneHeader, XzFault> []
+    todo("xz-nv.xzlzma.read_alone_header")
+
+// Whether a legacy header declares its uncompressed size.
+//
+// False means the stream ends with an end marker instead, and a
+// decoder must then rely on `xzrange.is_clean` to know it stopped in
+// the right place.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.read_alone_header(bytes.zeros(13))
+//         Ok(h)  => println("${xzlzma.alone_size_known(h)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn alone_size_known(h: XzAloneHeader) -> Bool []
+    todo("xz-nv.xzlzma.alone_size_known")
+
+// Decompress a whole legacy `.lzma` file held in memory.
+//
+// `limit` bounds the output; `-1` is unbounded.  The bound matters
+// more here than for `.xz`: a `.lzma` header may declare its size as
+// unknown, in which case nothing in the file says how large the
+// content is.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+//
+// fn main() [io]
+//     match xzlzma.decompress_alone(bytes.zeros(13), 1048576)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn decompress_alone(data: Bytes, limit: Int) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzlzma.decompress_alone")
+
+// Decode one LZMA symbol against a caller's model and dictionary.
+//
+// THE FUNCTION THE WHOLE DECODER IS A LOOP AROUND.  Takes the range
+// coder, the state, the remembered distances, the caller's probability
+// array and the output produced so far; answers what the symbol was.
+//
+// The output buffer is the caller's and is written in place, because
+// it is also the dictionary — an LZMA match reads from the bytes
+// already produced, so there is no separate window to copy into and
+// no way for this package to size one on a caller's behalf.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+// use xzrange
+//
+// fn main() [io]
+//     let s = xzlzma.decode_symbol(xzrange.start(bytes.zeros(5), 0), 0,
+//                                  xzlzma.reps_start(), bytes.zeros(64),
+//                                  bytes.zeros(16), 0, bytes.zeros(64), 0)
+//     println("${s.state}")
+// ```
+pub fn decode_symbol(r: XzRange, state: Int, reps: XzRepDistances, probs: Bytes, src: Bytes,
+                     off: Int, dst: Bytes, produced: Int) -> XzSymbol []
+    todo("xz-nv.xzlzma.decode_symbol")
+
+// What one symbol decode produced.
+//
+// A `@value` struct, so the symbol loop carries the coder, the state
+// and the four remembered distances in registers and allocates
+// nothing: a megabyte of LZMA is a few hundred thousand of these.
+//
+// `fault` is an integer code rather than an `XzFault`, for the reason
+// every `@value` struct in this package answers a flag: a boxed field
+// cannot live in an unboxed aggregate, and a symbol loop that
+// allocated a fault value per symbol would allocate on the path that
+// never fails.  `symbol_fault` turns the code into the fault the rest
+// of the package speaks.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+// use xzrange
+//
+// fn main() [io]
+//     let s = xzlzma.decode_symbol(xzrange.start(bytes.zeros(5), 0), 0,
+//                                  xzlzma.reps_start(), bytes.zeros(64),
+//                                  bytes.zeros(16), 0, bytes.zeros(64), 0)
+//     println("${s.produced}")
+// ```
+pub @value
+struct XzSymbol
+    // The range coder after the symbol.
+    coder: XzRange
+    // The state after it.
+    state: Int
+    // The remembered distances after it.
+    reps: XzRepDistances
+    // How many output bytes exist after it.
+    produced: Int
+    // Whether the symbol was the end marker.
+    ended: Bool
+    // Zero when the symbol was well formed, and otherwise one of the
+    // `XZ_SYMBOL_FAULT_*` codes.
+    fault: Int
+
+// The fault code for a symbol that was well formed: 0.
+pub const XZ_SYMBOL_FAULT_NONE = 0
+
+// The fault code for a match distance that reached past the output
+// produced so far or past the dictionary size.
+pub const XZ_SYMBOL_FAULT_DISTANCE = 1
+
+// The fault code for a range coder that ran out of source bytes.
+pub const XZ_SYMBOL_FAULT_RANGE = 2
+
+// The fault code for a symbol that would have written past the end of
+// the caller's output buffer.
+pub const XZ_SYMBOL_FAULT_BUFFER = 3
+
+// The fault a symbol's code means, or `None` for a well-formed one.
+//
+// The bridge between the integer this module's inner loop carries and
+// the `Result` every entry point above it speaks.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+// use xzrange
+//
+// fn main() [io]
+//     let s = xzlzma.decode_symbol(xzrange.start(bytes.zeros(5), 0), 0,
+//                                  xzlzma.reps_start(), bytes.zeros(64),
+//                                  bytes.zeros(16), 0, bytes.zeros(64), 0)
+//     match xzlzma.symbol_fault(s, 0)
+//         Some(_) => println("the symbol was malformed")
+//         None    => println("the symbol was well formed")
+// ```
+pub fn symbol_fault(s: XzSymbol, off: Int) -> ?XzFault []
+    todo("xz-nv.xzlzma.symbol_fault")

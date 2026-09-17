@@ -1,0 +1,192 @@
+// xzvli.nv — the variable-length integer every size field in an `.xz`
+// file is, and the four-byte padding rule that goes with it.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT A VLI IS.  Seven bits per byte, low bits first, with the top bit
+// set on every byte but the last: the same shape as a protobuf varint.
+// It is how a block header says how large its block is, how the index
+// says how large each block was, and how the number of index records is
+// written.
+//
+// AND THE FORMAT REQUIRES THE SHORTEST ENCODING.  `0x80 0x00` and
+// `0x00` both decode to zero under a naive reader, and the xz format
+// specification refuses the first.  That is not pedantry: a block's
+// size appears twice in a file, once in its header and once in the
+// index, and if one number has several spellings then a file can be
+// built whose two copies decode the same and hash differently.  So
+// `decode` refuses a non-canonical encoding, and `encode_bytes` answers
+// the one length the format permits.
+//
+// THE CEILING IS 2^63 - 1, IN NINE BYTES.  Nine bytes of seven bits is
+// sixty-three, which is the format's stated maximum and also what fits
+// in a signed 64-bit integer — so a decoder never has to reason about a
+// size it cannot represent.
+//
+// PADDING IS ZEROES TO A MULTIPLE OF FOUR, and it appears in three
+// places: after a block's compressed data, after the index, and between
+// streams.  It is always checked, never skipped: non-zero padding is a
+// corrupt file and not a decoder's business to tolerate.
+
+use xzerror
+
+// The most bytes a variable-length integer may occupy: 9.
+pub const XZ_VLI_BYTES_MOST = 9
+
+// The largest value a variable-length integer may hold: 2^63 - 1.
+pub const XZ_VLI_MAX = 9223372036854775807
+
+// The alignment every padding field pads to: 4 bytes.
+pub const XZ_PADDING_ALIGN = 4
+
+// One decoded variable-length integer: the value and how many bytes it
+// took.
+//
+// A `@value` struct, so a reader walking an index of ten thousand
+// records carries it in registers and allocates nothing.
+//
+// `ok` is false when the integer did not terminate within nine bytes,
+// when it was not in shortest form, or when there were not enough bytes
+// to finish it.  A `Result` would be the shape everywhere else in this
+// package, and it is not the shape here: a `@value` struct cannot be a
+// `Result` payload, and an index reader that allocated per record would
+// allocate ten thousand times to read a table of contents.
+pub @value
+struct XzVli
+    // The value, or 0 when `ok` is false.
+    value: Int
+    // How many bytes it occupied, `1` ..= `9`, or 0 when `ok` is false.
+    bytes: Int
+    // Whether a canonical integer was read at all.
+    ok: Bool
+
+// Read a variable-length integer from `src` at `off`.
+//
+// Refuses a tenth byte, a value above `XZ_VLI_MAX`, and an encoding
+// longer than the value needs.  Runs out of bytes rather than reading
+// past the end, which `ok` reports the same way — the caller
+// distinguishes the two with `bytes_left`.
+//
+// ```novo
+// use std.bytes
+// use xzvli
+//
+// fn main() [io]
+//     let v = xzvli.decode(bytes.from_str("\u{00}"), 0)
+//     println("${v.value} ${v.bytes} ${v.ok}")
+// ```
+pub fn decode(src: Bytes, off: Int) -> XzVli []
+    todo("xz-nv.xzvli.decode")
+
+// The fault a `decode` that answered `ok == false` should be reported
+// as, or `None`.
+//
+// `XzBadVli` at the offset, which `xzerror.is_corrupt` calls damage.
+// The bridge between the flag `decode` answers and the `Result` every
+// other entry point in this package speaks.
+//
+// ```novo
+// use std.bytes
+// use xzvli
+//
+// fn main() [io]
+//     match xzvli.decode_fault(xzvli.decode(bytes.zeros(0), 0), 0)
+//         Some(_) => println("not a canonical integer")
+//         None    => println("read cleanly")
+// ```
+pub fn decode_fault(v: XzVli, off: Int) -> ?XzFault []
+    todo("xz-nv.xzvli.decode_fault")
+
+// How many bytes the shortest encoding of `n` occupies, `1` ..= `9`.
+//
+// `XzBadParameter` for a negative `n`.  The function an encoder sizes
+// a header with, and the function `decode` checks a file's encoding
+// against.
+//
+// ```novo
+// use xzvli
+//
+// fn main() [io]
+//     match xzvli.encoded_bytes(127)
+//         Ok(n)  => println("${n}")
+//         Err(_) => println("not a value")
+// ```
+pub fn encoded_bytes(n: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzvli.encoded_bytes")
+
+// The bytes `n` encodes to, in the one form the format permits.
+//
+// ```novo
+// use std.bytes
+// use xzvli
+//
+// fn main() [io]
+//     match xzvli.encode(300)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(f) => println(f.message())
+// ```
+pub fn encode(n: Int) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzvli.encode")
+
+// Write `n` into a caller's buffer at `at`, and answer how many bytes
+// were written.
+//
+// The allocation-free form, for a header being assembled into a buffer
+// the caller already sized.  `XzBufferTooSmall` when `dst` has less
+// room than `encoded_bytes(n)`.
+//
+// ```novo
+// use std.bytes
+// use xzvli
+//
+// fn main() [io]
+//     match xzvli.encode_into(300, bytes.zeros(9), 0)
+//         Ok(n)  => println("${n}")
+//         Err(f) => println(f.message())
+// ```
+pub fn encode_into(n: Int, dst: Bytes, at: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzvli.encode_into")
+
+// How many padding bytes follow `n` bytes of content: `0` ..= `3`.
+//
+// The rule in all three places padding appears — after a block's
+// compressed data, after the index, and between streams — so a caller
+// never writes the modulo itself.
+//
+// ```novo
+// use xzvli
+//
+// fn main() [io]
+//     println("${xzvli.padding_after(5)}")
+// ```
+pub fn padding_after(n: Int) -> Int []
+    todo("xz-nv.xzvli.padding_after")
+
+// Whether `n` bytes of `src` from `off` are all zero.
+//
+// Padding is checked, not skipped: non-zero padding is a corrupt file.
+// A decoder that skipped it would accept a file with data hidden in
+// it, which is the shape covert-channel bugs take in every container
+// format that has padding.
+//
+// ```novo
+// use std.bytes
+// use xzvli
+//
+// fn main() [io]
+//     println("${xzvli.padding_is_clean(bytes.zeros(3), 0, 3)}")
+// ```
+pub fn padding_is_clean(src: Bytes, off: Int, n: Int) -> Bool []
+    todo("xz-nv.xzvli.padding_is_clean")
+
+// `n` rounded up to the next multiple of four.
+//
+// ```novo
+// use xzvli
+//
+// fn main() [io]
+//     println("${xzvli.round_up(5)}")
+// ```
+pub fn round_up(n: Int) -> Int []
+    todo("xz-nv.xzvli.round_up")

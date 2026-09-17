@@ -1,0 +1,343 @@
+// xzerror.nv — one fault type over two containers and three coders,
+// and the four questions that partition it.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// A POSITION NAMES THE LAYER IT WAS FOUND IN.  An `.xz` file is a
+// container holding blocks, each of which holds a filter chain, at the
+// end of which is an LZMA2 stream made of chunks holding LZMA1 symbols.
+// "Byte 41,984 is bad" does not say which of those five things is bad,
+// and the difference decides what a person does next: a broken stream
+// footer means the file was truncated in transit, and a broken LZMA
+// symbol means a bit flipped in the middle of it.
+//
+// FOUR QUESTIONS, NOT ONE.  `is_corrupt` says the data is damaged,
+// `is_incomplete` says more bytes would help, `is_limit` says this
+// program set a bound the data exceeded, and `is_unsupported` says the
+// file is perfectly good and asks for something this package does not
+// do.  The last one is why it is a separate question: the xz format is
+// EXTENSIBLE — new check types, new filter IDs and new flags are all
+// reserved — and a decoder that reported "corrupt" for a file from a
+// newer encoder would be telling the user their archive was broken
+// when it was not.
+
+// Where in an `.xz` file a fault was found.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     let w = xzerror.here(2, 41984, xzerror.XZ_LAYER_BLOCK)
+//     println("${w.block}")
+// ```
+pub struct XzWhere
+    // Which block, 0-based, or `-1` in the stream header, the index or
+    // the stream footer, where no block exists.
+    block: Int
+    // The byte offset from the first byte fed, across every chunk.
+    offset: Int
+    // Which layer was running: one of the `XZ_LAYER_*` constants.
+    layer: Int
+
+// The layer constant for the stream header and footer.
+pub const XZ_LAYER_STREAM = 0
+
+// The layer constant for a block header, its filter flags and its
+// padding.
+pub const XZ_LAYER_BLOCK = 1
+
+// The layer constant for the index and its records.
+pub const XZ_LAYER_INDEX = 2
+
+// The layer constant for a non-LZMA2 filter in the chain — delta, or
+// one of the branch converters.
+pub const XZ_LAYER_FILTER = 3
+
+// The layer constant for the LZMA2 chunk layer.
+pub const XZ_LAYER_LZMA2 = 4
+
+// The layer constant for the LZMA1 symbol layer and its range coder.
+pub const XZ_LAYER_LZMA = 5
+
+// The layer constant for the integrity check.
+pub const XZ_LAYER_CHECK = 6
+
+// A position, for a caller building a fault of its own.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println("${xzerror.here(-1, 0, xzerror.XZ_LAYER_STREAM).offset}")
+// ```
+pub fn here(block: Int, offset: Int, layer: Int) -> XzWhere []
+    todo("xz-nv.xzerror.here")
+
+// A short, stable name for a layer: `"stream"`, `"block"`, `"index"`,
+// `"filter"`, `"lzma2"`, `"lzma"`, `"check"`.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println(xzerror.layer_name(xzerror.XZ_LAYER_LZMA2))
+// ```
+pub fn layer_name(layer: Int) -> Str []
+    todo("xz-nv.xzerror.layer_name")
+
+// Why an `.xz` or `.lzma` stream could not be decoded.
+//
+// The order is the order a decoder meets them: the stream header, the
+// block header, the filters, LZMA2, LZMA1, the check, the index, the
+// footer.
+//
+// Every variant is prefixed `Xz`, because a variant is constructed by
+// NAME across a whole program.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     let f = xzerror.fault(XzBadMagic, xzerror.here(-1, 0, 0))
+//     println(xzerror.kind_name(f.kind))
+// ```
+pub enum XzFaultKind
+    // The first six bytes were not `FD 37 7A 58 5A 00`.  The file is
+    // not `.xz` at all, which is what a caller sniffing an unknown
+    // archive is asking.
+    XzBadMagic
+    // The stream footer's last two bytes were not `YZ`.
+    XzBadFooterMagic
+    // A stream header or footer's CRC-32 over its two flag bytes did
+    // not match.  Carries both.
+    //
+    // The xz format checksums its own header, which is what lets a
+    // decoder tell "this is not xz" from "this is xz and the first
+    // twelve bytes are damaged".
+    XzHeaderCrcMismatch(declared: Int, computed: Int)
+    // The stream footer's flags did not equal the stream header's.
+    // The format requires the two copies to agree, which is what makes
+    // a truncated-and-reappended file detectable.
+    XzFlagsMismatch
+    // A reserved bit was set in a place the format requires it clear —
+    // the stream flags' first byte, a block header's reserved bits, a
+    // filter flag.  Carries the offset in the enclosing field.
+    XzReservedBitSet(at: Int)
+    // The check type in the stream flags is one the format reserves
+    // and this package does not implement.  Carries the type number.
+    //
+    // NOT corruption.  `is_unsupported` answers true; a newer encoder
+    // may legitimately write one, and `xzdec.with_lenient_check` is
+    // how a caller decides to read the data anyway.
+    XzUnsupportedCheck(check: Int)
+    // A multibyte integer did not terminate within nine bytes, or
+    // encoded a value above the format's ceiling, or was not in the
+    // shortest form the format requires.
+    //
+    // The shortest-form rule matters: without it the same number has
+    // many encodings and two decoders disagree about a block's size.
+    XzBadVli(at: Int)
+    // A block header whose declared size, filter count or padding is
+    // not what the format allows.
+    XzBadBlockHeader(at: Int)
+    // A filter ID the format reserves, or one this package does not
+    // implement.  Carries the ID.  `is_unsupported`, not corruption.
+    XzUnsupportedFilter(id: Int)
+    // A filter chain the format refuses: more than four filters, a
+    // chain whose last filter is not a compression filter, or a
+    // branch converter that appears twice.
+    XzBadFilterChain(what: Str)
+    // A filter's properties are not what that filter accepts — a
+    // delta distance of zero, an LZMA2 dictionary-size byte above 40,
+    // a BCJ start offset that is not aligned.
+    XzBadFilterProperties(id: Int)
+    // An LZMA2 control byte the format does not define, or a chunk
+    // that asked for a state reset before any properties had been
+    // given.
+    XzBadLzma2Chunk(control: Int)
+    // An LZMA2 chunk that referred to the dictionary before it had
+    // been reset, which the format requires at the first chunk of a
+    // block.
+    XzLzma2NoDictionaryReset
+    // The LZMA properties byte encoded `lc + lp > 4`, which no decoder
+    // can build a probability table for.  Carries the byte.
+    XzBadLzmaProperties(got: Int)
+    // A match distance reached further back than the bytes decoded so
+    // far, or further than the dictionary size allows.
+    //
+    // THE CHECK THAT MAKES THE DECODER SAFE.  Without it the match
+    // reads whatever is in front of the window and hands it back as
+    // plaintext.
+    XzDistanceTooFar(distance: Int, available: Int)
+    // The range coder's normalisation invariant was broken: the first
+    // byte of a range-coded stream was not zero, or the coder ended
+    // with a non-zero code.
+    XzBadRangeCoder(at: Int)
+    // The block produced a different number of bytes, or consumed a
+    // different number, than its header declared.  Carries both.
+    XzSizeMismatch(declared: Int, actual: Int)
+    // The block's integrity check did not match the content.  Carries
+    // the check type, so a log can say whether a CRC-32 or a SHA-256
+    // disagreed.
+    XzCheckMismatch(check: Int)
+    // The index does not describe the blocks that were decoded — a
+    // record count, an unpadded size or an uncompressed total that
+    // disagrees.
+    //
+    // A block-level check can pass on every block and this still fail,
+    // because the index also fixes their ORDER and their COUNT.
+    XzIndexMismatch(what: Str)
+    // The stream footer's backward size did not point at the start of
+    // the index.
+    //
+    // The field an `.xz` reader seeks by, which is why a wrong one is
+    // its own fault kind rather than a generic index failure.
+    XzBadBackwardSize(declared: Int)
+    // Bytes followed the last stream footer that were neither stream
+    // padding — four-byte-aligned zeroes — nor another stream header,
+    // and the decoder was asked to be strict about it.
+    XzTrailingBytes(at: Int)
+    // The stream ended in the middle of something.  Carries how many
+    // more bytes the decoder needed to finish what it had started, or
+    // `-1` where it cannot say.
+    //
+    // NOT corruption: it is what `finish` answers when the caller has
+    // not fed the whole file yet.
+    XzTruncated(need: Int)
+    // The decoder produced more content than the caller's output limit
+    // allowed, or a block asked for a dictionary larger than the
+    // caller's limit.  Carries both numbers.
+    XzLimitReached(wanted: Int, allowed: Int)
+    // A caller-supplied buffer was too small for what it was handed.
+    XzBufferTooSmall(want: Int, have: Int)
+    // A caller's parameter was outside the range the function
+    // documents.
+    XzBadParameter(what: Str)
+    // The stream supplied to `xzdec.read_all` failed.
+    XzSourceFailed
+
+// A fault, with the position it was found at.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     let f = xzerror.fault(XzBadMagic, xzerror.here(-1, 0, 0))
+//     println("${f.at.offset}")
+// ```
+pub struct XzFault
+    // Why.
+    kind: XzFaultKind
+    // Where.
+    at: XzWhere
+
+// How an `XzFault` reads when a `Result` carrying one is reported.
+impl Error for XzFault
+    // The one-line report: the reason, the block, the layer and the
+    // byte offset, in that order.  The position is in the text rather
+    // than left for the caller to add, because a compressed stream has
+    // no other landmark a person can navigate to.
+    fn message(self) -> Str
+        todo("xz-nv.xzerror.XzFault.message")
+
+// A fault from a kind and a position.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println(xzerror.kind_name(
+//         xzerror.fault(XzBadFooterMagic, xzerror.here(-1, 40, 0)).kind))
+// ```
+pub fn fault(kind: XzFaultKind, at: XzWhere) -> XzFault []
+    todo("xz-nv.xzerror.fault")
+
+// A short, stable name for a kind: `"bad-magic"`, `"check-mismatch"`,
+// `"unsupported-filter"`.
+//
+// Stable because it goes in logs and in test expectations, and a
+// sentence that reads better next year is a sentence that breaks a
+// grep written this year.  `describe` is the sentence.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println(xzerror.kind_name(XzBadMagic))
+// ```
+pub fn kind_name(k: XzFaultKind) -> Str []
+    todo("xz-nv.xzerror.kind_name")
+
+// One English sentence saying what went wrong and where, with every
+// number the variant carries in it.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println(xzerror.describe(
+//         xzerror.fault(XzUnsupportedCheck(2), xzerror.here(-1, 7, 0))))
+// ```
+pub fn describe(f: XzFault) -> Str []
+    todo("xz-nv.xzerror.describe")
+
+// Whether the stream is DAMAGED, as opposed to unfinished, over a
+// bound this program set, or asking for something this package does
+// not do.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println("${xzerror.is_corrupt(XzBadFooterMagic)}")
+// ```
+pub fn is_corrupt(k: XzFaultKind) -> Bool []
+    todo("xz-nv.xzerror.is_corrupt")
+
+// Whether the decoder simply has not been given enough bytes yet.
+//
+// True for `XzTruncated` alone.  A caller streaming a file over a
+// socket asks this to decide between "wait for more" and "give up".
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println("${xzerror.is_incomplete(XzTruncated(12))}")
+// ```
+pub fn is_incomplete(k: XzFaultKind) -> Bool []
+    todo("xz-nv.xzerror.is_incomplete")
+
+// Whether the fault is a bound this program chose rather than anything
+// about the data.
+//
+// True for `XzLimitReached` and `XzBufferTooSmall`.  Both name a
+// number the caller can raise; neither says the file is bad.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println("${xzerror.is_limit(XzBufferTooSmall(65536, 4096))}")
+// ```
+pub fn is_limit(k: XzFaultKind) -> Bool []
+    todo("xz-nv.xzerror.is_limit")
+
+// Whether the file is GOOD and asks for something this package does
+// not do.
+//
+// True for `XzUnsupportedCheck` and `XzUnsupportedFilter`.  The
+// question that exists because the xz format is extensible: new check
+// types and new filter IDs are reserved, and a decoder that called a
+// file from a newer encoder "corrupt" would be telling a user their
+// archive was broken when it was not.
+//
+// ```novo
+// use xzerror
+//
+// fn main() [io]
+//     println("${xzerror.is_unsupported(XzUnsupportedFilter(0x20))}")
+// ```
+pub fn is_unsupported(k: XzFaultKind) -> Bool []
+    todo("xz-nv.xzerror.is_unsupported")

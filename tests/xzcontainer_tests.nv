@@ -1,0 +1,245 @@
+// xzcontainer_tests.nv — the variable-length integer, the stream
+// header and footer, the four integrity checks, and the index that
+// makes an `.xz` seekable.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// xz-nv.<module>.<fn>`.
+
+use std.test
+use std.bytes
+use xzcheck
+use xzerror
+use xzindex
+use xzstream
+use xzvli
+
+@test
+fn test_a_vli_has_exactly_one_spelling_per_number() [io]
+    // Without the shortest-form rule the same number has many
+    // encodings, and a block's size appears twice in a file.
+    test.case("a one-byte integer is one byte")
+    let v = xzvli.decode(bytes.zeros(1), 0)
+    test.assert(v.ok and v.value == 0 and v.bytes == 1)
+
+    test.case("the ceiling is 2^63 - 1 in nine bytes")
+    test.assert(xzvli.XZ_VLI_BYTES_MOST == 9)
+    test.assert(xzvli.XZ_VLI_MAX == 9223372036854775807)
+
+    test.case("the shortest encoding is what the format permits")
+    match xzvli.encoded_bytes(127)
+        Ok(n)  => test.assert(n == 1)
+        Err(_) => test.fail("127 is a value")
+    match xzvli.encoded_bytes(128)
+        Ok(n)  => test.assert(n == 2)
+        Err(_) => test.fail("128 is a value")
+
+    test.case("and a non-canonical encoding is refused rather than accepted")
+    let padded = xzvli.decode(bytes.from_str("\u{80}\u{00}"), 0)
+    test.assert(not padded.ok)
+    match xzvli.decode_fault(padded, 0)
+        Some(f) => test.assert(xzerror.kind_name(f.kind) == "bad-vli")
+        None    => test.fail("0x80 0x00 is a padded zero")
+
+    test.case("encoding round-trips through both forms")
+    match xzvli.encode(300)
+        Ok(b)  => test.assert(bytes.len(b) == 2)
+        Err(_) => test.fail("300 is a value")
+    match xzvli.encode_into(300, bytes.zeros(9), 0)
+        Ok(n)  => test.assert(n == 2)
+        Err(_) => test.fail("nine bytes is room for any integer")
+
+@test
+fn test_padding_is_checked_and_never_skipped() [io]
+    // A decoder that skipped padding would accept a file with data
+    // hidden in it.
+    test.case("padding runs to a four-byte boundary")
+    test.assert(xzvli.XZ_PADDING_ALIGN == 4)
+    test.assert(xzvli.padding_after(5) == 3)
+    test.assert(xzvli.padding_after(8) == 0)
+    test.assert(xzvli.round_up(5) == 8)
+
+    test.case("and it has to be zeroes")
+    test.assert(xzvli.padding_is_clean(bytes.zeros(3), 0, 3))
+    test.assert(not xzvli.padding_is_clean(bytes.from_str("\u{01}"), 0, 1))
+
+@test
+fn test_the_stream_flags_are_written_twice_on_purpose() [io]
+    // It is what catches a file that was truncated and had another
+    // file's tail appended.
+    test.case("the header and the footer are both twelve bytes")
+    test.assert(xzstream.XZ_HEADER_BYTES == 12)
+    test.assert(xzstream.XZ_FOOTER_BYTES == 12)
+    test.assert(xzstream.XZ_HEADER_MAGIC_BYTES == 6)
+    test.assert(xzstream.XZ_FOOTER_MAGIC_BYTES == 2)
+
+    test.case("flags carry the one check type the whole stream uses")
+    match xzstream.flags(xzcheck.XZ_CHECK_CRC64)
+        Ok(f)  =>
+            test.assert(f.check == xzcheck.XZ_CHECK_CRC64)
+            test.assert(bytes.len(xzstream.header_bytes(f)) == 12)
+            test.assert(xzstream.flags_agree(f, f))
+            match xzstream.footer_bytes(f, 4)
+                Ok(b)  => test.assert(bytes.len(b) == 12)
+                Err(_) => test.fail("four bytes is a legal index size")
+        Err(_) => test.fail("CRC-64 is a check type")
+
+    test.case("a header that is not xz at all says so, not `corrupt`")
+    match xzstream.read_header(bytes.zeros(12))
+        Ok(_)  => test.fail("twelve zero bytes are not an xz header")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-magic")
+
+    test.case("and a footer without YZ is its own fault kind")
+    match xzstream.read_footer(bytes.zeros(12))
+        Ok(_)  => test.fail("twelve zero bytes are not an xz footer")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+    test.case("streams in a concatenated file are separated to a boundary")
+    test.assert(xzstream.padding_after(13) == 3)
+
+    test.case("and a parsed header answers its check type as a number")
+    match xzstream.read_header(bytes.zeros(12))
+        Ok(h)  => test.assert(xzstream.check_of(h) >= 0)
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+@test
+fn test_a_fault_names_its_layer_and_reads_as_one_sentence() [io]
+    // "Byte 41,984 is bad" does not say which of five layers is bad,
+    // and the difference decides what a person does next.
+    test.case("each of the seven layers has a stable name")
+    test.assert(xzerror.layer_name(xzerror.XZ_LAYER_STREAM) == "stream")
+    test.assert(xzerror.layer_name(xzerror.XZ_LAYER_BLOCK) == "block")
+    test.assert(xzerror.layer_name(xzerror.XZ_LAYER_INDEX) == "index")
+    test.assert(xzerror.layer_name(xzerror.XZ_LAYER_FILTER) == "filter")
+    test.assert(xzerror.layer_name(xzerror.XZ_LAYER_LZMA2) == "lzma2")
+    test.assert(xzerror.layer_name(xzerror.XZ_LAYER_LZMA) == "lzma")
+    test.assert(xzerror.layer_name(xzerror.XZ_LAYER_CHECK) == "check")
+
+    test.case("a position carries the block, the offset and the layer")
+    let w = xzerror.here(2, 41984, xzerror.XZ_LAYER_BLOCK)
+    test.assert(w.block == 2 and w.offset == 41984)
+    test.assert(w.layer == xzerror.XZ_LAYER_BLOCK)
+
+    test.case("a fault is a kind and a place, and it reports as one line")
+    let f = xzerror.fault(XzBadMagic, xzerror.here(-1, 0, xzerror.XZ_LAYER_STREAM))
+    test.assert(xzerror.kind_name(f.kind) == "bad-magic")
+    test.assert(str.len(xzerror.describe(f)) > 0)
+    test.assert(str.len(f.message()) > 0)
+
+@test
+fn test_the_check_size_is_known_even_for_a_check_this_package_cannot_do() [io]
+    // That is what lets a decoder SKIP an unsupported check and still
+    // find the next block header.
+    test.case("the four the format defines")
+    match xzcheck.size_of(xzcheck.XZ_CHECK_NONE)
+        Ok(n)  => test.assert(n == 0)
+        Err(_) => test.fail("none is a check type")
+    match xzcheck.size_of(xzcheck.XZ_CHECK_CRC32)
+        Ok(n)  => test.assert(n == 4)
+        Err(_) => test.fail("crc32 is a check type")
+    match xzcheck.size_of(xzcheck.XZ_CHECK_CRC64)
+        Ok(n)  => test.assert(n == 8)
+        Err(_) => test.fail("crc64 is a check type")
+    match xzcheck.size_of(xzcheck.XZ_CHECK_SHA256)
+        Ok(n)  => test.assert(n == 32)
+        Err(_) => test.fail("sha256 is a check type")
+
+    test.case("a reserved type still has a size, and that is the point")
+    match xzcheck.size_of(0x02)
+        Ok(n)  => test.assert(n == 4)
+        Err(_) => test.fail("the format fixes the reserved sizes in groups")
+
+    test.case("but this package cannot verify it, which is not corruption")
+    test.assert(not xzcheck.is_supported(0x02))
+    test.assert(xzerror.is_unsupported(XzUnsupportedCheck(2)))
+    test.assert(not xzerror.is_corrupt(XzUnsupportedCheck(2)))
+
+    test.case("and every type has a stable name")
+    test.assert(xzcheck.name_of(xzcheck.XZ_CHECK_CRC32) == "crc32")
+    test.assert(xzcheck.name_of(xzcheck.XZ_CHECK_NONE) == "none")
+
+@test
+fn test_crc64_is_this_packages_because_no_row_on_the_registry_has_it() [io]
+    test.case("the catalogue check value for \"123456789\"")
+    test.assert(xzcheck.crc64(bytes.from_str("123456789")) == xzcheck.XZ_CRC64_CHECK)
+    test.assert(xzcheck.XZ_CRC64_CHECK == 0x995DC9BBDF1939FA)
+
+    test.case("the polynomial is ECMA-182's, reflected")
+    test.assert(xzcheck.XZ_CRC64_POLY == 0xC96C5795D7870F42)
+
+    test.case("the register starts all ones and finishes complemented")
+    test.assert(xzcheck.crc64_finish(xzcheck.crc64_init()) == 0)
+
+    test.case("and a message arrives in pieces")
+    let whole = xzcheck.crc64_update(xzcheck.crc64_init(),
+                                     bytes.from_str("123456789"), 0, 9)
+    let piece = xzcheck.crc64_update(
+        xzcheck.crc64_update(xzcheck.crc64_init(),
+                             bytes.from_str("123456789"), 0, 4),
+        bytes.from_str("123456789"), 4, 5)
+    test.assert(whole == piece)
+
+    test.case("the table's first entry is zero")
+    test.assert(xzcheck.crc64_table_entry(0) == 0)
+
+@test
+fn test_one_check_value_covers_all_four_types() [io]
+    test.case("a running check remembers its type and its length")
+    match xzcheck.start(xzcheck.XZ_CHECK_CRC32)
+        Ok(s)  =>
+            test.assert(xzcheck.kind_of(s) == xzcheck.XZ_CHECK_CRC32)
+            test.assert(xzcheck.fed_bytes(s) == 0)
+            let fed = xzcheck.update(s, bytes.from_str("123456789"), 0, 9)
+            test.assert(xzcheck.fed_bytes(fed) == 9)
+            test.assert(bytes.len(xzcheck.finish(fed)) == 4)
+        Err(_) => test.fail("crc32 is a check type")
+
+    test.case("a check of `none` finishes to no bytes at all")
+    match xzcheck.start(xzcheck.XZ_CHECK_NONE)
+        Ok(s)  =>
+            test.assert(bytes.len(xzcheck.finish(s)) == 0)
+            test.assert(xzcheck.matches(s, bytes.zeros(0)))
+        Err(_) => test.fail("none is a check type")
+
+    test.case("and a reserved type is refused at construction")
+    match xzcheck.start(0x02)
+        Ok(_)  => test.fail("0x02 is reserved")
+        Err(f) => test.assert(xzerror.is_unsupported(f.kind))
+
+@test
+fn test_the_index_is_the_table_of_contents_gzip_does_not_have() [io]
+    test.case("a record is the UNPADDED size and the uncompressed size")
+    let r = xzindex.record(116, 65536)
+    test.assert(r.unpadded == 116 and r.uncompressed == 65536)
+
+    test.case("an empty index describes no blocks and no bytes")
+    let i = xzindex.index([])
+    test.assert(xzindex.block_count(i) == 0)
+    test.assert(xzindex.total_uncompressed(i) == 0)
+    test.assert(xzindex.total_compressed(i) == 0)
+
+    test.case("its encoded size is what the footer's backward size has to match")
+    match xzindex.encoded_bytes(i)
+        Ok(n)  => test.assert(n > 0)
+        Err(_) => test.fail("an empty index still encodes")
+    match xzindex.encode(i)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("an empty index still encodes")
+
+    test.case("offsets add the padding back, once, here")
+    test.assert(list.len(xzindex.offsets_of(i)) == 0)
+
+    test.case("and random access asks which block an output offset falls in")
+    test.assert(xzindex.block_at(i, 0) == -1)
+
+    test.case("an index is checked against the blocks that were read")
+    match xzindex.agrees_with(i, [])
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("an empty index agrees with no blocks")
+
+    test.case("a damaged index is refused rather than trusted")
+    match xzindex.read(bytes.zeros(8), 0)
+        Ok(_)  => test.fail("eight zero bytes are not an index")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+    test.case("the indicator byte is what tells an index from another block")
+    test.assert(xzindex.XZ_INDEX_INDICATOR_BYTE == 0x00)

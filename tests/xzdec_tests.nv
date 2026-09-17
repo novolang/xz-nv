@@ -1,0 +1,233 @@
+// xzdec_tests.nv — the feed-and-drain decoder, its two bounds, the
+// index that makes an `.xz` seekable, and the encoder's declared
+// surface.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// xz-nv.<module>.<fn>`.
+
+use std.test
+use std.bytes
+use xzcheck
+use xzdec
+use xzenc
+use xzerror
+use xzindex
+
+@test
+fn test_a_fresh_decoder_bounds_the_dictionary_and_not_the_output() [io]
+    test.case("nothing in, nothing out, no blocks and no streams")
+    let d = xzdec.decoder()
+    test.assert(xzdec.total_in(d) == 0)
+    test.assert(xzdec.total_out(d) == 0)
+    test.assert(xzdec.blocks_done(d) == 0)
+    test.assert(xzdec.streams_done(d) == 0)
+    test.assert(xzdec.verified_out(d) == 0)
+
+    test.case("the dictionary limit starts where `xz -9` asks: 64 MiB")
+    test.assert(xzdec.dict_limit_of(d) == xzdec.XZ_DICT_LIMIT_DEFAULT)
+    test.assert(xzdec.XZ_DICT_LIMIT_DEFAULT == 67108864)
+
+    test.case("and the output is unbounded, because an .xz declares its size")
+    test.assert(xzdec.limit_of(d) == -1)
+
+    test.case("neither strictness is on by default")
+    test.assert(not xzdec.is_strict_check(d))
+    test.assert(not xzdec.is_strict_tail(d))
+
+    test.case("there is no failure and no header yet")
+    match xzdec.error(d)
+        Some(_) => test.fail("a fresh decoder has not failed")
+        None    => test.assert(true)
+    match xzdec.stream_header(d)
+        Some(_) => test.fail("no bytes have been fed")
+        None    => test.assert(true)
+    test.assert(xzdec.check_type(d) == -1)
+
+@test
+fn test_the_dictionary_limit_is_a_policy_and_not_a_claim_about_the_file() [io]
+    // A block header's one byte can ask for 4 GiB, and that demand is
+    // entirely invisible in the file's name.
+    test.case("a caller can lower it and read it back")
+    let d = xzdec.with_dict_limit(xzdec.decoder(), 8388608)
+    test.assert(xzdec.dict_limit_of(d) == 8388608)
+
+    test.case("a block over the limit is a bound, not damage")
+    test.assert(xzerror.is_limit(XzLimitReached(67108864, 8388608)))
+    test.assert(not xzerror.is_corrupt(XzLimitReached(67108864, 8388608)))
+
+    test.case("and the output bound is a separate, second decision")
+    let both = xzdec.with_limit(d, 1048576)
+    test.assert(xzdec.limit_of(both) == 1048576)
+    test.assert(xzdec.dict_limit_of(both) == 8388608)
+
+@test
+fn test_an_unsupported_check_is_skipped_unless_a_caller_says_otherwise() [io]
+    // The format reserves twelve check types it does not define, and
+    // fixes their sizes, so a decoder can skip one and still find the
+    // next block.
+    test.case("strictness is off by default and turns on as a whole decoder")
+    test.assert(xzdec.is_strict_check(xzdec.with_strict_check(xzdec.decoder())))
+
+    test.case("and trailing-byte strictness is a different switch")
+    test.assert(xzdec.is_strict_tail(xzdec.with_strict_tail(xzdec.decoder())))
+    test.assert(not xzdec.is_strict_check(xzdec.with_strict_tail(xzdec.decoder())))
+
+    test.case("a reserved check is `unsupported`, which is not `corrupt`")
+    test.assert(xzerror.is_unsupported(XzUnsupportedCheck(2)))
+    test.assert(xzerror.is_unsupported(XzUnsupportedFilter(0x20)))
+    test.assert(not xzerror.is_corrupt(XzUnsupportedFilter(0x20)))
+
+@test
+fn test_feed_answers_bytes_and_a_decoder_and_never_a_result() [io]
+    test.case("a chunk that lands in the stream header produces no content")
+    let (d, out) = xzdec.feed(xzdec.decoder(), bytes.zeros(12))
+    test.assert(bytes.len(out) == 0)
+
+    test.case("and a chunk may split anything")
+    let (d1, o1) = xzdec.feed(xzdec.decoder(), bytes.zeros(6))
+    let (d2, o2) = xzdec.feed(d1, bytes.zeros(6))
+    test.assert(bytes.len(o1) == 0 and bytes.len(o2) == 0)
+    test.assert(xzdec.total_in(d2) == 12)
+
+@test
+fn test_finish_reports_an_unfinished_stream_as_truncated() [io]
+    test.case("a decoder in the middle of something is incomplete, not corrupt")
+    match xzdec.finish(xzdec.decoder())
+        Ok(_)  => test.fail("nothing was fed, so nothing finished")
+        Err(f) =>
+            test.assert(xzerror.is_incomplete(f.kind))
+            test.assert(not xzerror.is_corrupt(f.kind))
+
+@test
+fn test_the_one_shot_entry_points_verify_every_layer() [io]
+    test.case("twelve zero bytes are not an xz header")
+    match xzdec.decompress(bytes.zeros(12))
+        Ok(_)  => test.fail("twelve zero bytes are not xz")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-magic")
+
+    test.case("the bounded form takes the two bounds the unbounded one does not")
+    match xzdec.decompress_bounded(bytes.zeros(12), 8388608, 1048576)
+        Ok(_)  => test.fail("twelve zero bytes are not xz")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+    test.case("the header can be read on its own, in twelve bytes")
+    match xzdec.header_of(bytes.zeros(12))
+        Ok(_)  => test.fail("twelve zero bytes are not an xz header")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-magic")
+
+@test
+fn test_the_index_is_read_from_the_tail_and_costs_nothing() [io]
+    // The call that makes `.xz` different from `.gz`: the decompressed
+    // length of a forty-gigabyte archive, without decompressing a byte.
+    test.case("a file too short to hold a footer has no index")
+    match xzdec.index_of(bytes.zeros(24))
+        Ok(i)  => test.assert(xzindex.block_count(i) >= 0)
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+    test.case("and a block can then be decoded on its own, from its offset")
+    match xzdec.decompress_block(bytes.zeros(64), 12, 8388608)
+        Ok(_)  => test.fail("sixty-four zero bytes hold no block")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+@test
+fn test_read_all_binds_its_callers_effect_rather_than_spending_one() [io]
+    // `S: Read[e]` and a `[e]` clause: a file charges [io], an
+    // in-memory buffer charges nothing, and this package stays `core`.
+    test.case("an in-memory source charges the caller nothing")
+    let src: Buffer = Buffer.from_str("not an xz file")
+    match xzdec.read_all(src)
+        Ok(_)  => test.fail("that is not an xz file")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-magic")
+
+@test
+fn test_the_encoder_is_settings_rather_than_six_optional_arguments() [io]
+    test.case("a preset runs 0 to 9 and the default is 6")
+    test.assert(xzenc.XZ_PRESET_LEAST == 0)
+    test.assert(xzenc.XZ_PRESET_MOST == 9)
+    test.assert(xzenc.XZ_PRESET_DEFAULT == 6)
+
+    test.case("settings carry the preset, the chain, the check and the block size")
+    match xzenc.settings(6)
+        Ok(s)  =>
+            test.assert(s.preset == 6)
+            test.assert(s.check == xzcheck.XZ_CHECK_CRC64)
+            test.assert(s.block_bytes == -1)
+        Err(_) => test.fail("6 is a preset")
+
+    test.case("a preset outside the range is this program's mistake")
+    match xzenc.settings(12)
+        Ok(_)  => test.fail("12 is not a preset")
+        Err(f) =>
+            test.assert(not xzerror.is_corrupt(f.kind))
+            test.assert(not xzerror.is_unsupported(f.kind))
+
+    test.case("what a preset actually CHANGES is the dictionary it asks for")
+    match xzenc.dictionary_bytes_for(9)
+        Ok(n)  => test.assert(n == 67108864)
+        Err(_) => test.fail("9 is a preset")
+
+@test
+fn test_setting_a_block_size_is_what_makes_the_output_seekable() [io]
+    test.case("the check type can be changed")
+    match xzenc.settings(6)
+        Ok(s)  =>
+            test.assert(xzenc.with_check(s, xzcheck.XZ_CHECK_CRC32).check
+                        == xzcheck.XZ_CHECK_CRC32)
+        Err(_) => test.fail("6 is a preset")
+
+    test.case("an illegal chain is refused at configuration time, not at the first block")
+    match xzenc.settings(6)
+        Ok(s)  =>
+            match xzenc.with_filters(s, [])
+                Ok(_)  => test.fail("an empty chain has no compression filter")
+                Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-filter-chain")
+        Err(_) => test.fail("6 is a preset")
+
+    test.case("a block size makes the index worth having")
+    match xzenc.settings(6)
+        Ok(s)  =>
+            match xzenc.with_block_bytes(s, 16777216)
+                Ok(s2) => test.assert(s2.block_bytes == 16777216)
+                Err(_) => test.fail("16 MiB is a legal block size")
+        Err(_) => test.fail("6 is a preset")
+
+    test.case("and a tiny one is refused")
+    match xzenc.settings(6)
+        Ok(s)  =>
+            match xzenc.with_block_bytes(s, 16)
+                Ok(_)  => test.fail("sixteen bytes is below the floor")
+                Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-parameter")
+        Err(_) => test.fail("6 is a preset")
+
+@test
+fn test_the_encoder_pushes_and_closes_like_the_decoder_feeds_and_finishes() [io]
+    test.case("an encoder starts empty")
+    match xzenc.settings(6)
+        Ok(s)  =>
+            let e = xzenc.encoder(s)
+            test.assert(xzenc.total_in(e) == 0)
+            test.assert(xzenc.blocks_written(e) == 0)
+
+            let (e2, out) = xzenc.push(e, bytes.from_str("hello"))
+            test.assert(bytes.len(out) == 0)
+            test.assert(xzenc.total_in(e2) == 5)
+
+            match xzenc.close(e2)
+                Ok(b)  => test.assert(bytes.len(b) > 0)
+                Err(_) => test.fail("five bytes closes into one block and a footer")
+
+        Err(_) => test.fail("6 is a preset")
+
+    test.case("the one-shot forms are the same machine with the pump written once")
+    match xzenc.compress(bytes.from_str("hello"))
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("five bytes compress")
+    match xzenc.settings(1)
+        Ok(s)  =>
+            match xzenc.compress_with(bytes.from_str("hello"), s)
+                Ok(b)  => test.assert(bytes.len(b) > 0)
+                Err(_) => test.fail("five bytes compress at preset 1")
+        Err(_) => test.fail("1 is a preset")
+
+    test.case(".xz can EXPAND, so the bound is above the input")
+    test.assert(xzenc.compress_bound(1048576) > 1048576)

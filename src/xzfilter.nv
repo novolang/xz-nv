@@ -1,0 +1,362 @@
+// xzfilter.nv — the filter chain: one compressor, and up to three
+// transforms in front of it that do not compress anything.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// A FILTER THAT DOES NOT COMPRESS IS STILL WORTH RUNNING.  The delta
+// filter and the seven branch converters produce output exactly as
+// large as their input.  What they do is make it MORE COMPRESSIBLE for
+// the filter after them, and the effect is not small: an x86 executable
+// filtered through the BCJ converter compresses about five per cent
+// smaller, and 16-bit PCM audio through a delta of two compresses
+// dramatically smaller.
+//
+// WHAT A BRANCH CONVERTER DOES.  A compiled x86 binary is full of
+// `CALL` and `JMP` instructions whose operand is a RELATIVE offset, so
+// the same function called from two places produces two different byte
+// sequences.  The converter rewrites those operands to be ABSOLUTE,
+// which turns them into the same bytes, which a match finder can then
+// find.  The decoder rewrites them back.  It is reversible, it is
+// per-architecture, and getting the instruction detection wrong
+// corrupts the output silently — which is why each converter's
+// alignment is a published constant here rather than a number inside a
+// loop.
+//
+// ALL EIGHT CONVERTERS ARE IN.  x86, PowerPC, IA-64, ARM, ARM-Thumb,
+// SPARC, ARM64 and RISC-V: the format assigns each an ID, `xz` will
+// write any of them, and a decoder missing one refuses a file it
+// should read.  The delta filter is in for the same reason.
+//
+// THE CHAIN'S RULES ARE FOUR AND EVERY ONE IS A WAY A FILE CAN BE
+// MALFORMED: at most four filters; exactly one compression filter;
+// that one last; and no branch converter twice.  `check_chain` is all
+// four in one call, so a decoder never encodes them by hand and an
+// encoder never builds a chain a decoder will refuse.
+
+use xzerror
+
+// The filter ID for delta: `0x03`.
+pub const XZ_FILTER_DELTA = 0x03
+
+// The filter ID for the x86 branch converter: `0x04`.
+pub const XZ_FILTER_X86 = 0x04
+
+// The filter ID for the PowerPC branch converter: `0x05`.
+pub const XZ_FILTER_POWERPC = 0x05
+
+// The filter ID for the IA-64 branch converter: `0x06`.
+pub const XZ_FILTER_IA64 = 0x06
+
+// The filter ID for the ARM branch converter: `0x07`.
+pub const XZ_FILTER_ARM = 0x07
+
+// The filter ID for the ARM-Thumb branch converter: `0x08`.
+pub const XZ_FILTER_ARMTHUMB = 0x08
+
+// The filter ID for the SPARC branch converter: `0x09`.
+pub const XZ_FILTER_SPARC = 0x09
+
+// The filter ID for the ARM64 branch converter: `0x0A`.
+pub const XZ_FILTER_ARM64 = 0x0A
+
+// The filter ID for the RISC-V branch converter: `0x0B`.
+pub const XZ_FILTER_RISCV = 0x0B
+
+// The filter ID for LZMA2: `0x21`.
+//
+// The only compression filter the xz format defines, and the one every
+// legal chain ends with.
+pub const XZ_FILTER_LZMA2 = 0x21
+
+// The filter ID for LZMA1: `0x4000000000000001`.
+//
+// Legal in a raw stream and in the legacy `.lzma` container, and
+// REFUSED inside an `.xz` block — the format says so, because LZMA1
+// has no way to signal its own end and an `.xz` block needs one.
+pub const XZ_FILTER_LZMA1 = 0x4000000000000001
+
+// The smallest delta distance: 1.
+pub const XZ_DELTA_DISTANCE_LEAST = 1
+
+// The largest delta distance: 256.
+pub const XZ_DELTA_DISTANCE_MOST = 256
+
+// One filter in a chain: its ID and its properties.
+//
+// Properties are kept as the bytes the file carries rather than as a
+// per-filter struct, because there are ten filters and eight of them
+// have either no properties or one four-byte start offset.  `delta`
+// and `lzma2` have accessors that decode theirs.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.delta(1)
+//         Ok(f)  => println("${f.id}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzFilter
+    // The filter ID, one of the `XZ_FILTER_*` constants.
+    id: Int
+    // The filter's properties, exactly as the block header carries
+    // them.  Empty for a converter with no start offset.
+    props: Bytes
+
+// The delta filter with a distance of `n` bytes, `1` ..= `256`.
+//
+// A delta of 1 is "each byte minus the one before it"; a delta of 2
+// suits 16-bit stereo audio, and 3 suits 24-bit RGB.  It compresses
+// nothing by itself — the output is exactly as large as the input —
+// and it makes what follows it compress far better.
+//
+// `XzBadFilterProperties` outside the range, which
+// `xzerror.is_corrupt` calls damage.  Zero in particular is
+// refused rather than treated as one, because the file's byte is
+// `distance - 1` and a decoder that read it as the distance would be
+// off by one on every file.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.delta(2)
+//         Ok(f)  => println("${xzfilter.delta_distance(f)!}")
+//         Err(e) => println(e.message())
+// ```
+pub fn delta(n: Int) -> Result<XzFilter, XzFault> []
+    todo("xz-nv.xzfilter.delta")
+
+// The distance a delta filter was built with.
+//
+// `XzBadFilterProperties` when the filter is not a delta filter.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.delta(3)
+//         Ok(f) =>
+//             match xzfilter.delta_distance(f)
+//                 Ok(n)  => println("${n}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn delta_distance(f: XzFilter) -> Result<Int, XzFault> []
+    todo("xz-nv.xzfilter.delta_distance")
+
+// A branch converter for an architecture, with a start offset.
+//
+// The start offset is the address the filtered data begins at, which
+// matters because the converter rewrites relative offsets into
+// absolute ones and "absolute" has to be absolute with respect to
+// something.  Zero is the ordinary value and the only one `xz` writes.
+//
+// `XzUnsupportedFilter` for an ID that is not one of the eight
+// converters, and `XzBadFilterProperties` for a start offset that is
+// not a multiple of that architecture's alignment.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.branch(xzfilter.XZ_FILTER_X86, 0)
+//         Ok(f)  => println("${f.id}")
+//         Err(e) => println(e.message())
+// ```
+pub fn branch(id: Int, start_offset: Int) -> Result<XzFilter, XzFault> []
+    todo("xz-nv.xzfilter.branch")
+
+// The instruction alignment a branch converter works at, in bytes.
+//
+// 1 for x86, 2 for ARM-Thumb and RISC-V, 4 for PowerPC, ARM, SPARC and
+// ARM64, and 16 for IA-64.  A published constant per architecture
+// rather than a number inside a loop, because getting it wrong
+// corrupts the output silently.
+//
+// `XzUnsupportedFilter` for an ID that is not a converter.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.branch_alignment(xzfilter.XZ_FILTER_IA64)
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn branch_alignment(id: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzfilter.branch_alignment")
+
+// The start offset a branch converter was built with, or 0.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.branch(xzfilter.XZ_FILTER_ARM64, 0)
+//         Ok(f)  => println("${xzfilter.branch_start(f)!}")
+//         Err(e) => println(e.message())
+// ```
+pub fn branch_start(f: XzFilter) -> Result<Int, XzFault> []
+    todo("xz-nv.xzfilter.branch_start")
+
+// An LZMA2 filter with a dictionary size, in bytes.
+//
+// The file carries the size as a single byte, which encodes only the
+// values `(2 | (b & 1)) << (b / 2 + 11)` — so not every number of
+// bytes is expressible, and `lzma2_dictionary_bytes` answers the one a
+// byte means while this takes the byte's own value.
+//
+// `XzBadFilterProperties` above 40, which is the format's ceiling.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.lzma2(24)
+//         Ok(f)  => println("${f.id}")
+//         Err(e) => println(e.message())
+// ```
+pub fn lzma2(dict_byte: Int) -> Result<XzFilter, XzFault> []
+    todo("xz-nv.xzfilter.lzma2")
+
+// The dictionary size a dictionary byte means, in bytes.
+//
+// `XzBadFilterProperties` above 40.  THE NUMBER A CALLER BUDGETS
+// WITH: the dictionary is the largest allocation an `.xz` decoder
+// makes, `xz -9` asks for 64 MiB of it, and a decoder that simply
+// obeyed would be one any file could make exhaust a machine.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.lzma2_dictionary_bytes(24)
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn lzma2_dictionary_bytes(dict_byte: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzfilter.lzma2_dictionary_bytes")
+
+// The smallest dictionary byte whose size is at least `n` bytes.
+//
+// The encoder's side of `lzma2_dictionary_bytes`, and what a caller
+// raising a decoder's dictionary limit compares against.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.lzma2_dictionary_byte_for(1048576)
+//         Ok(b)  => println("${b}")
+//         Err(e) => println(e.message())
+// ```
+pub fn lzma2_dictionary_byte_for(n: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzfilter.lzma2_dictionary_byte_for")
+
+// Whether a filter ID names a compression filter.
+//
+// True for LZMA2 and LZMA1, false for delta and the eight converters.
+// The predicate the chain rules are written in.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     println("${xzfilter.is_compression(xzfilter.XZ_FILTER_LZMA2)}")
+// ```
+pub fn is_compression(id: Int) -> Bool []
+    todo("xz-nv.xzfilter.is_compression")
+
+// Whether a filter ID names one of the eight branch converters.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     println("${xzfilter.is_branch(xzfilter.XZ_FILTER_RISCV)}")
+// ```
+pub fn is_branch(id: Int) -> Bool []
+    todo("xz-nv.xzfilter.is_branch")
+
+// A short, stable name for a filter ID: `"delta"`, `"x86"`,
+// `"lzma2"`, or `"unknown-<id>"`.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     println(xzfilter.name_of(xzfilter.XZ_FILTER_ARMTHUMB))
+// ```
+pub fn name_of(id: Int) -> Str []
+    todo("xz-nv.xzfilter.name_of")
+
+// Check a chain against all four of the format's rules at once.
+//
+// At most four filters; exactly one compression filter; that one last;
+// no branch converter twice.  `XzBadFilterChain` naming which rule
+// broke, so an encoder building a chain gets told what it did rather
+// than that something was wrong.
+//
+// Also refuses LZMA1 inside an `.xz` block, which is a fifth rule the
+// format states separately: LZMA1 cannot signal its own end and an
+// `.xz` block needs it to.
+//
+// ```novo
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.check_chain([])
+//         Ok(_)  => println("an empty chain has no compression filter")
+//         Err(e) => println(e.message())
+// ```
+pub fn check_chain(filters: [XzFilter]) -> Result<Int, XzFault> []
+    todo("xz-nv.xzfilter.check_chain")
+
+// Apply a non-compression filter's decode direction in place, over `n`
+// bytes of `dst` from `at`.
+//
+// Delta and the eight converters all produce output exactly as large
+// as their input, so there is one buffer and no sizing question — the
+// one place in this package where a transform can be in place, and the
+// reason there is no `_into` pair here.
+//
+// `XzUnsupportedFilter` when the filter is a compression filter,
+// which is decoded by `xzlzma2` and not here.
+//
+// ```novo
+// use std.bytes
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.delta(1)
+//         Ok(f) =>
+//             match xzfilter.decode_in_place(f, bytes.zeros(8), 0, 8)
+//                 Ok(b)  => println("${bytes.len(b)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_in_place(f: XzFilter, dst: Bytes, at: Int, n: Int) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzfilter.decode_in_place")
+
+// Apply a non-compression filter's encode direction in place.
+//
+// The inverse of `decode_in_place`, declared for the encoder release
+// so that a test can round-trip a buffer through both once the bodies
+// land.
+//
+// ```novo
+// use std.bytes
+// use xzfilter
+//
+// fn main() [io]
+//     match xzfilter.branch(xzfilter.XZ_FILTER_X86, 0)
+//         Ok(f) =>
+//             match xzfilter.encode_in_place(f, bytes.zeros(16), 0, 16)
+//                 Ok(b)  => println("${bytes.len(b)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn encode_in_place(f: XzFilter, dst: Bytes, at: Int, n: Int) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzfilter.encode_in_place")

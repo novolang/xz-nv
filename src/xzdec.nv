@@ -1,0 +1,507 @@
+// xzdec.nv — the load-bearing interface: an `.xz` decoder that
+// performs nothing.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE SHAPE, AND WHY IT IS THIS ONE
+//
+// `xz-nv` is a `core` package, so its budget is no effects at all and
+// it may not read a file, a socket or standard input.  A compressed
+// stream is exactly the thing a caller wants to stream.  Those two
+// facts are reconciled by a FEED-AND-DRAIN STATE MACHINE: the host
+// holds the stream, hands this package whatever bytes it has, and gets
+// back the content those bytes produced plus a decoder to hand the next
+// chunk to.  Nothing here reads and nothing here waits.
+//
+//     var d = xzdec.decoder()
+//     let (d2, out) = xzdec.feed(d, chunk)      // as many times as you like
+//     let tail = xzdec.finish(d2)!              // once, at end of stream
+//
+// It is the same vocabulary zstd-nv, brotli-nv and bzip2-nv publish,
+// deliberately: a caller writing a decompressing pipe over four formats
+// writes the pump once.
+//
+// THE DICTIONARY LIMIT IS THE ONE DECISION THIS PACKAGE WILL NOT MAKE
+// FOR YOU.  A block header's one dictionary byte can ask for 4 GiB, and
+// `xz -9` routinely asks for 64 MiB — which is the number that makes
+// `.xz` awkward on a small machine and is entirely invisible in the
+// file's name.  `decoder()` starts at 64 MiB, the size `xz -9` uses, so
+// the ordinary file decodes and the hostile one does not; a block that
+// asks for more is `XzLimitReached` carrying both numbers, so a caller
+// can raise the limit deliberately and retry rather than discovering
+// the demand as a failed allocation.
+//
+// THE OUTPUT LIMIT IS A SECOND, SEPARATE BOUND, and it is unbounded by
+// default.  An `.xz` file usually declares its uncompressed size — in
+// every block header that carries the field, and in every index record
+// — so a caller that wants to know before it decodes asks
+// `xzdec.index_of` and gets an answer without decompressing a byte.
+// That is a thing `.gz` cannot do and is the reason the bound can
+// safely default to off.
+//
+// WHY `feed` DOES NOT RETURN A `Result`
+//
+// It returns the content the chunk produced and a decoder that may have
+// gone bad, and `error` is what asks.  A corrupt block six blocks into
+// an archive does not throw away the five before it: a caller
+// recovering a damaged file wants the prefix, and a signature that made
+// the failure the return value would have had to choose between the
+// bytes and the reason.  The failure is sticky.
+//
+// AN UNSUPPORTED CHECK IS NOT A FAILURE BY DEFAULT.  The format
+// reserves twelve check types it does not define, and their sizes are
+// fixed, so a decoder can skip one it cannot verify and still find the
+// next block.  `with_strict_check` turns that into a refusal for a
+// caller who would rather not read data nothing verified.
+//
+// A FILE IS A SEQUENCE OF STREAMS, AND THIS DECODER READS ALL OF THEM.
+
+use xzerror
+use xzindex
+use xzstream
+
+// A decoder between chunks.
+//
+// Opaque in practice — the fields are here so that the state is
+// reviewable rather than because a caller should read them — and
+// carried by value: `feed` returns the next one and the previous one
+// is finished with.  A decoder that has failed stays failed; `error`
+// is what says so, and every subsequent `feed` produces nothing.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.total_in(xzdec.decoder())}")
+// ```
+pub struct XzDecoder
+    // Which layer the machine is in: one of `xzerror.XZ_LAYER_*`.  An
+    // `Int` rather than an enum so the whole decoder stays cheap to
+    // copy.
+    layer: Int
+    // The header of the stream being read, or absent before the first
+    // twelve bytes have arrived.
+    stream: ?XzStreamHeader
+    // How many streams have been finished.
+    streams: Int
+    // How many blocks have been finished, across every stream.
+    blocks: Int
+    // The index records the decoder has built from the blocks it read,
+    // which the stream's own index is checked against.
+    read_records: [XzIndexRecord]
+    // Compressed bytes consumed so far, across every `feed`.
+    consumed: Int
+    // Content bytes produced so far.
+    produced: Int
+    // Content bytes whose block check has been verified.
+    verified: Int
+    // The largest dictionary this decoder will accept a block asking
+    // for, in bytes.
+    dict_limit: Int
+    // The output bound from `with_limit`, or `-1` for unbounded.
+    limit: Int
+    // Whether an unsupported check type is a refusal rather than a
+    // skip.
+    strict_check: Bool
+    // Whether bytes after the last stream footer are a refusal.
+    strict_tail: Bool
+    // The sticky failure, or absent.
+    failure: ?XzFault
+
+// The dictionary limit a fresh decoder starts with: 67,108,864 bytes.
+//
+// 64 MiB, which is what `xz -9` asks for — so the ordinary file
+// decodes without ceremony and a file asking for 4 GiB does not.
+pub const XZ_DICT_LIMIT_DEFAULT = 67108864
+
+// A decoder with nothing fed to it, a 64 MiB dictionary limit,
+// unbounded output, and neither strictness.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.blocks_done(xzdec.decoder())}")
+// ```
+pub fn decoder() -> XzDecoder []
+    todo("xz-nv.xzdec.decoder")
+
+// A decoder that refuses a block asking for a dictionary larger than
+// `cap` bytes.
+//
+// `XzLimitReached` carrying both numbers, which `xzerror.is_limit`
+// separates from damage: a block that wants 64 MiB from a caller who
+// budgeted 8 is a perfectly good block meeting a perfectly good
+// policy.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.dict_limit_of(xzdec.with_dict_limit(xzdec.decoder(), 8388608))}")
+// ```
+pub fn with_dict_limit(d: XzDecoder, cap: Int) -> XzDecoder []
+    todo("xz-nv.xzdec.with_dict_limit")
+
+// The dictionary limit in force, in bytes.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.dict_limit_of(xzdec.decoder())}")
+// ```
+pub fn dict_limit_of(d: XzDecoder) -> Int []
+    todo("xz-nv.xzdec.dict_limit_of")
+
+// A decoder that refuses to produce more than `cap` bytes of content.
+//
+// `-1` is unbounded, which is the default — an `.xz` usually declares
+// its uncompressed size, so a caller who wants to know asks
+// `index_of` rather than guarding against a surprise.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.limit_of(xzdec.with_limit(xzdec.decoder(), 1048576))}")
+// ```
+pub fn with_limit(d: XzDecoder, cap: Int) -> XzDecoder []
+    todo("xz-nv.xzdec.with_limit")
+
+// The output bound in force, or `-1`.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.limit_of(xzdec.decoder())}")
+// ```
+pub fn limit_of(d: XzDecoder) -> Int []
+    todo("xz-nv.xzdec.limit_of")
+
+// A decoder that refuses a stream whose check type it cannot verify.
+//
+// Off by default: the format reserves twelve check types it does not
+// define and fixes their sizes, so a decoder can skip one and still
+// find the next block, and a file from a newer encoder is not a
+// broken file.  On, `XzUnsupportedCheck`, for a caller who would
+// rather not read data that nothing verified.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.is_strict_check(xzdec.with_strict_check(xzdec.decoder()))}")
+// ```
+pub fn with_strict_check(d: XzDecoder) -> XzDecoder []
+    todo("xz-nv.xzdec.with_strict_check")
+
+// Whether `with_strict_check` was asked for.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.is_strict_check(xzdec.decoder())}")
+// ```
+pub fn is_strict_check(d: XzDecoder) -> Bool []
+    todo("xz-nv.xzdec.is_strict_check")
+
+// A decoder that refuses bytes after the last stream footer.
+//
+// Off by default, because stream padding is legal and a tool that
+// padded its output still wrote a file everyone else reads.  On,
+// anything that is neither four-byte-aligned zeroes nor another
+// stream header is `XzTrailingBytes`.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.is_strict_tail(xzdec.with_strict_tail(xzdec.decoder()))}")
+// ```
+pub fn with_strict_tail(d: XzDecoder) -> XzDecoder []
+    todo("xz-nv.xzdec.with_strict_tail")
+
+// Whether `with_strict_tail` was asked for.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.is_strict_tail(xzdec.decoder())}")
+// ```
+pub fn is_strict_tail(d: XzDecoder) -> Bool []
+    todo("xz-nv.xzdec.is_strict_tail")
+
+// Hand the decoder the next chunk, and take whatever content it
+// produced.
+//
+// Answers the decoder to hand the NEXT chunk to, and the content bytes
+// this chunk completed.  No `Result`: see the module comment.  A
+// decoder that has already failed answers itself and no bytes.
+//
+// ```novo
+// use std.bytes
+// use xzdec
+//
+// fn main() [io]
+//     let (d, out) = xzdec.feed(xzdec.decoder(), bytes.zeros(12))
+//     println("${bytes.len(out)} ${xzdec.total_in(d)}")
+// ```
+pub fn feed(d: XzDecoder, chunk: Bytes) -> (XzDecoder, Bytes) []
+    todo("xz-nv.xzdec.feed")
+
+// End of stream: the last content, or the reason there is none.
+//
+// Called once, after the last `feed`.  `XzTruncated` when the decoder
+// is in the middle of something; the sticky failure when there is one;
+// `XzIndexMismatch` when the index did not describe the blocks that
+// were read.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     match xzdec.finish(xzdec.decoder())
+//         Ok(_)  => println("done")
+//         Err(e) => println(e.message())
+// ```
+pub fn finish(d: XzDecoder) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzdec.finish")
+
+// The sticky failure, or `None`.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     match xzdec.error(xzdec.decoder())
+//         Some(e) => println(e.message())
+//         None    => println("no failure yet")
+// ```
+pub fn error(d: XzDecoder) -> ?XzFault []
+    todo("xz-nv.xzdec.error")
+
+// Compressed bytes consumed so far.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.total_in(xzdec.decoder())}")
+// ```
+pub fn total_in(d: XzDecoder) -> Int []
+    todo("xz-nv.xzdec.total_in")
+
+// Content bytes produced so far.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.total_out(xzdec.decoder())}")
+// ```
+pub fn total_out(d: XzDecoder) -> Int []
+    todo("xz-nv.xzdec.total_out")
+
+// Content bytes whose block check has been VERIFIED.
+//
+// `.xz` checks every block, not only the stream, so everything up to
+// the last block boundary is already known to be right and a caller
+// writing decompressed bytes into a file as they arrive can know how
+// much of what it wrote is safe.  Equal to `total_out` between blocks,
+// and zero for a stream whose check type is `none`.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.verified_out(xzdec.decoder())}")
+// ```
+pub fn verified_out(d: XzDecoder) -> Int []
+    todo("xz-nv.xzdec.verified_out")
+
+// How many blocks have been finished, across every stream.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.blocks_done(xzdec.decoder())}")
+// ```
+pub fn blocks_done(d: XzDecoder) -> Int []
+    todo("xz-nv.xzdec.blocks_done")
+
+// How many streams have been finished.
+//
+// A concatenated `.xz` has more than one, and a caller that expected
+// exactly one checks this rather than trusting that the first footer
+// was the end.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.streams_done(xzdec.decoder())}")
+// ```
+pub fn streams_done(d: XzDecoder) -> Int []
+    todo("xz-nv.xzdec.streams_done")
+
+// The check type the stream in progress declares, or `-1`.
+//
+// Published because `none` is a legal check type and a caller that
+// cares whether anything verified its data should be able to see that
+// nothing did.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     println("${xzdec.check_type(xzdec.decoder())}")
+// ```
+pub fn check_type(d: XzDecoder) -> Int []
+    todo("xz-nv.xzdec.check_type")
+
+// The header of the stream being read, or `None`.
+//
+// ```novo
+// use xzdec
+//
+// fn main() [io]
+//     match xzdec.stream_header(xzdec.decoder())
+//         Some(h) => println("${h.flags.check}")
+//         None    => println("no header yet")
+// ```
+pub fn stream_header(d: XzDecoder) -> ?XzStreamHeader []
+    todo("xz-nv.xzdec.stream_header")
+
+// Decompress a whole `.xz` held in memory.
+//
+// Buffers, so `Ok` means every block check, every index and every
+// stream footer verified.  Reads every stream in the input.
+//
+// ```novo
+// use std.bytes
+// use xzdec
+//
+// fn main() [io]
+//     match xzdec.decompress(bytes.zeros(12))
+//         Ok(b)  => println("${bytes.len(b)} byte(s)")
+//         Err(e) => println(e.message())
+// ```
+pub fn decompress(data: Bytes) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzdec.decompress")
+
+// Decompress a whole `.xz`, with both bounds.
+//
+// `decompress` with the dictionary limit and the output limit a caller
+// handling an untrusted file wants.  `-1` for either is unbounded.
+//
+// ```novo
+// use std.bytes
+// use xzdec
+//
+// fn main() [io]
+//     match xzdec.decompress_bounded(bytes.zeros(12), 8388608, 1048576)
+//         Ok(b)  => println("${bytes.len(b)} byte(s)")
+//         Err(e) => println(e.message())
+// ```
+pub fn decompress_bounded(data: Bytes, dict_limit: Int, limit: Int) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzdec.decompress_bounded")
+
+// The stream header a `.xz` starts with, without decoding anything.
+//
+// Twelve bytes, the same read `xzstream.read_header` does.
+// `XzBadMagic` says the file is not `.xz` at all, and
+// `XzHeaderCrcMismatch` says it is and its first twelve bytes are
+// damaged — a distinction a caller sniffing an unknown archive acts
+// on.
+//
+// ```novo
+// use std.bytes
+// use xzdec
+//
+// fn main() [io]
+//     match xzdec.header_of(bytes.zeros(12))
+//         Ok(h)  => println("${h.flags.check}")
+//         Err(e) => println(e.message())
+// ```
+pub fn header_of(data: Bytes) -> Result<XzStreamHeader, XzFault> []
+    todo("xz-nv.xzdec.header_of")
+
+// The index of a whole `.xz` held in memory, read from its tail.
+//
+// THE CALL THAT MAKES `.xz` DIFFERENT FROM `.gz`.  The last twelve
+// bytes give the index's size, the index gives one record per block,
+// and `xzindex.total_uncompressed` gives the file's decompressed
+// length — without decompressing a byte.  `xz --list` is this call,
+// and so is the first step of any random access into an archive.
+//
+// ```novo
+// use std.bytes
+// use xzdec
+// use xzindex
+//
+// fn main() [io]
+//     match xzdec.index_of(bytes.zeros(24))
+//         Ok(i)  => println("${xzindex.total_uncompressed(i)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn index_of(data: Bytes) -> Result<XzIndex, XzFault> []
+    todo("xz-nv.xzdec.index_of")
+
+// Decompress one block of an `.xz`, given its offset from the index.
+//
+// The random-access call, and the reason `xzindex.offsets_of` exists.
+// A block whose header declares both sizes can be decoded on its own,
+// with no knowledge of the blocks before it — which is what `pixz`
+// does in parallel and what a reader seeking to byte three billion
+// does once.
+//
+// `XzBadBlockHeader` when the offset does not land on a block header.
+//
+// ```novo
+// use std.bytes
+// use xzdec
+//
+// fn main() [io]
+//     match xzdec.decompress_block(bytes.zeros(64), 12, 8388608)
+//         Ok(b)  => println("${bytes.len(b)} byte(s)")
+//         Err(e) => println(e.message())
+// ```
+pub fn decompress_block(data: Bytes, at: Int, dict_limit: Int) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzdec.decompress_block")
+
+// Decompress everything a stream yields.
+//
+// THE SECOND LOAD-BEARING SIGNATURE OF THIS PACKAGE.  `S: Read[e]`
+// binds the effect parameter of the standard library's `Read` trait
+// and the clause is `[e]`, so the row means "whatever the impl behind
+// `S` supplies" — the call site substitutes it, a `File` charges its
+// caller `[io]`, an in-memory buffer charges nothing, and this package
+// remains `core` because it has not named an effect of its own
+// (SPEC § 5.6).
+//
+// ```novo
+// use std.bytes
+// use xzdec
+// use xzerror
+//
+// fn read_xz(path: Str) -> Result<Bytes, XzFault> [io, fs]
+//     match File.open_read(path)
+//         None    => Err(xzerror.fault(XzSourceFailed,
+//                                      xzerror.here(-1, -1, 0)))
+//         Some(f) =>
+//             let h: File = f
+//             xzdec.read_all(h)
+//
+// fn main() [io, fs]
+//     match read_xz("data.xz")
+//         Ok(b)  => println("${bytes.len(b)} byte(s)")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_all<S: Read[e]>(src: S) -> Result<Bytes, XzFault> [e]
+    todo("xz-nv.xzdec.read_all")

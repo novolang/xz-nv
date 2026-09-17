@@ -1,0 +1,215 @@
+// xzfilter_tests.nv — the block header, its optional binding sizes,
+// the filter chain and its four rules.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// xz-nv.<module>.<fn>`.
+
+use std.test
+use std.bytes
+use xzblock
+use xzerror
+use xzfilter
+
+@test
+fn test_the_first_byte_says_block_or_index_with_no_lookahead() [io]
+    test.case("zero is the index indicator")
+    test.assert(xzblock.header_size_from(xzblock.XZ_INDEX_INDICATOR) == 0)
+
+    test.case("and any other value is the header's size in bytes")
+    test.assert(xzblock.header_size_from(1) == 8)
+    test.assert(xzblock.header_size_from(255) == xzblock.XZ_BLOCK_HEADER_BYTES_MOST)
+    test.assert(xzblock.XZ_BLOCK_HEADER_BYTES_LEAST == 8)
+
+@test
+fn test_a_declared_size_is_binding_and_an_absent_one_is_not_checked() [io]
+    test.case("both fields absent means neither is checked")
+    let none = xzblock.header([], -1, -1)
+    test.assert(not xzblock.has_compressed_size(none))
+    test.assert(not xzblock.has_uncompressed_size(none))
+    match xzblock.check_sizes(none, 40, 100)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("an absent field cannot disagree with anything")
+
+    test.case("a declared uncompressed size is present and binding")
+    let some = xzblock.header([], -1, 64)
+    test.assert(xzblock.has_uncompressed_size(some))
+    match xzblock.check_sizes(some, 40, 65)
+        Ok(_)  => test.fail("the header said 64 and the block produced 65")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "size-mismatch")
+
+    test.case("the index records the UNPADDED size, header and check included")
+    match xzblock.unpadded_size(12, 100, 4)
+        Ok(n)  => test.assert(n == 116)
+        Err(_) => test.fail("three non-negative numbers")
+
+    test.case("and the padding is derivable, which is why it is not stored")
+    test.assert(xzblock.padding_after(5) == 3)
+    test.assert(xzblock.padding_after(4) == 0)
+
+    test.case("a damaged header is refused")
+    match xzblock.read_header(bytes.zeros(12), 0)
+        Ok(_)  => test.fail("twelve zero bytes are not a block header")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+    test.case("and a header encodes back to bytes padded and checksummed")
+    match xzblock.header_bytes(none)
+        Ok(b)  => test.assert(bytes.len(b) >= 8)
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+@test
+fn test_the_delta_filter_compresses_nothing_and_that_is_the_point() [io]
+    test.case("a delta of two suits 16-bit audio, three suits 24-bit RGB")
+    match xzfilter.delta(2)
+        Ok(f)  =>
+            test.assert(f.id == xzfilter.XZ_FILTER_DELTA)
+            match xzfilter.delta_distance(f)
+                Ok(n)  => test.assert(n == 2)
+                Err(_) => test.fail("it was built with a distance of two")
+        Err(_) => test.fail("two is a legal delta distance")
+
+    test.case("zero is refused rather than read as one")
+    match xzfilter.delta(0)
+        Ok(_)  => test.fail("the file's byte is distance - 1, so zero means one")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-filter-properties")
+    test.assert(xzfilter.XZ_DELTA_DISTANCE_LEAST == 1)
+    test.assert(xzfilter.XZ_DELTA_DISTANCE_MOST == 256)
+
+    test.case("and the filter is not a compression filter")
+    test.assert(not xzfilter.is_compression(xzfilter.XZ_FILTER_DELTA))
+    test.assert(not xzfilter.is_branch(xzfilter.XZ_FILTER_DELTA))
+
+@test
+fn test_all_eight_branch_converters_are_in_and_each_has_its_alignment() [io]
+    // Getting the alignment wrong corrupts the output silently, which
+    // is why it is a published constant per architecture.
+    test.case("x86 works one byte at a time")
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_X86)
+        Ok(n)  => test.assert(n == 1)
+        Err(_) => test.fail("x86 is a branch converter")
+
+    test.case("ARM-Thumb and RISC-V work two bytes at a time")
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_ARMTHUMB)
+        Ok(n)  => test.assert(n == 2)
+        Err(_) => test.fail("ARM-Thumb is a branch converter")
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_RISCV)
+        Ok(n)  => test.assert(n == 2)
+        Err(_) => test.fail("RISC-V is a branch converter")
+
+    test.case("PowerPC, ARM, SPARC and ARM64 work four bytes at a time")
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_POWERPC)
+        Ok(n)  => test.assert(n == 4)
+        Err(_) => test.fail("PowerPC is a branch converter")
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_ARM)
+        Ok(n)  => test.assert(n == 4)
+        Err(_) => test.fail("ARM is a branch converter")
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_SPARC)
+        Ok(n)  => test.assert(n == 4)
+        Err(_) => test.fail("SPARC is a branch converter")
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_ARM64)
+        Ok(n)  => test.assert(n == 4)
+        Err(_) => test.fail("ARM64 is a branch converter")
+
+    test.case("and IA-64 works sixteen at a time, in instruction bundles")
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_IA64)
+        Ok(n)  => test.assert(n == 16)
+        Err(_) => test.fail("IA-64 is a branch converter")
+
+    test.case("a converter carries a start offset, and zero is what xz writes")
+    match xzfilter.branch(xzfilter.XZ_FILTER_X86, 0)
+        Ok(f)  =>
+            test.assert(xzfilter.is_branch(f.id))
+            match xzfilter.branch_start(f)
+                Ok(n)  => test.assert(n == 0)
+                Err(_) => test.fail("it was built with a start of zero")
+        Err(_) => test.fail("x86 with a zero start is a legal filter")
+
+    test.case("an ID that is not a converter says `unsupported`, not `corrupt`")
+    match xzfilter.branch_alignment(0x20)
+        Ok(_)  => test.fail("0x20 is not a filter this package knows")
+        Err(f) => test.assert(xzerror.is_unsupported(f.kind))
+
+    test.case("every filter has a stable name")
+    test.assert(xzfilter.name_of(xzfilter.XZ_FILTER_LZMA2) == "lzma2")
+    test.assert(xzfilter.name_of(xzfilter.XZ_FILTER_ARMTHUMB) == "armthumb")
+
+@test
+fn test_the_dictionary_byte_is_where_a_64_mib_demand_hides() [io]
+    // A block header's one byte can ask for 4 GiB, and `xz -9`
+    // routinely asks for 64 MiB.
+    test.case("a dictionary byte becomes a size in bytes")
+    match xzfilter.lzma2_dictionary_bytes(0)
+        Ok(n)  => test.assert(n == 4096)
+        Err(_) => test.fail("0 is a legal dictionary byte")
+
+    test.case("and 40 is the format's ceiling, refused above")
+    match xzfilter.lzma2_dictionary_bytes(41)
+        Ok(_)  => test.fail("41 is above the format's ceiling")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-filter-properties")
+
+    test.case("the encoder's direction picks the smallest byte that fits")
+    match xzfilter.lzma2_dictionary_byte_for(1048576)
+        Ok(b)  => test.assert(b >= 0 and b <= 40)
+        Err(_) => test.fail("a megabyte is expressible")
+
+    test.case("an LZMA2 filter is built from the byte the file carries")
+    match xzfilter.lzma2(24)
+        Ok(f)  => test.assert(xzfilter.is_compression(f.id))
+        Err(_) => test.fail("24 is a legal dictionary byte")
+
+@test
+fn test_the_chains_four_rules_are_one_call() [io]
+    test.case("an empty chain has no compression filter")
+    match xzfilter.check_chain([])
+        Ok(_)  => test.fail("a chain must end in a compression filter")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-filter-chain")
+
+    test.case("a chain of one LZMA2 filter is legal")
+    match xzfilter.lzma2(24)
+        Ok(l)  =>
+            match xzfilter.check_chain([l])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.fail("LZMA2 alone is the ordinary chain")
+        Err(_) => test.fail("24 is a legal dictionary byte")
+
+    test.case("the compression filter has to be LAST")
+    match xzfilter.lzma2(24)
+        Ok(l)  =>
+            match xzfilter.delta(1)
+                Ok(d)  =>
+                    match xzfilter.check_chain([l, d])
+                        Ok(_)  => test.fail("LZMA2 is not last here")
+                        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+                Err(_) => test.fail("one is a legal delta distance")
+        Err(_) => test.fail("24 is a legal dictionary byte")
+
+    test.case("LZMA1 is legal in a raw stream and refused inside an .xz block")
+    test.assert(xzfilter.is_compression(xzfilter.XZ_FILTER_LZMA1))
+    test.assert(xzblock.XZ_FILTERS_MOST == 4)
+
+@test
+fn test_a_non_compression_filter_runs_in_place_both_ways() [io]
+    // Delta and the eight converters produce output exactly as large
+    // as their input, so there is one buffer and no sizing question.
+    test.case("decoding runs over the caller's buffer")
+    match xzfilter.delta(1)
+        Ok(f)  =>
+            match xzfilter.decode_in_place(f, bytes.zeros(8), 0, 8)
+                Ok(b)  => test.assert(bytes.len(b) == 8)
+                Err(_) => test.fail("eight bytes of eight bytes")
+        Err(_) => test.fail("one is a legal delta distance")
+
+    test.case("and so does encoding, so a test can round-trip a buffer")
+    match xzfilter.branch(xzfilter.XZ_FILTER_X86, 0)
+        Ok(f)  =>
+            match xzfilter.encode_in_place(f, bytes.zeros(16), 0, 16)
+                Ok(b)  => test.assert(bytes.len(b) == 16)
+                Err(_) => test.fail("sixteen bytes of sixteen bytes")
+        Err(_) => test.fail("x86 with a zero start is a legal filter")
+
+    test.case("a compression filter is not decoded here")
+    match xzfilter.lzma2(24)
+        Ok(l)  =>
+            match xzfilter.decode_in_place(l, bytes.zeros(8), 0, 8)
+                Ok(_)  => test.fail("LZMA2 is xzlzma2's job, not this one's")
+                Err(f) => test.assert(xzerror.is_unsupported(f.kind))
+        Err(_) => test.fail("24 is a legal dictionary byte")

@@ -1,0 +1,322 @@
+// xzlzma2.nv — the chunk layer that makes LZMA restartable, resettable
+// and able to hold data it could not compress.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY LZMA2 EXISTS AT ALL.  LZMA1 is one range-coded stream from the
+// first byte to the last.  Three things follow from that and all three
+// are problems.  It cannot store incompressible data without making it
+// larger.  It cannot be decoded from the middle, so it cannot be
+// decompressed in parallel.  And it has no way to say where it ends
+// except an end marker, which a container then cannot skip over.
+//
+// LZMA2 IS A SEQUENCE OF CHUNKS, each with its own size, and that
+// answers all three.  A chunk is either UNCOMPRESSED — up to 64 KiB of
+// bytes stored as they are, which is what an encoder writes when LZMA
+// would have expanded them — or COMPRESSED, up to 2 MiB of output from
+// up to 64 KiB of input, with a control byte that says what was reset
+// before it.
+//
+// THE CONTROL BYTE IS THE WHOLE PROTOCOL.  `0x00` ends the stream.
+// `0x01` and `0x02` are uncompressed chunks, the first resetting the
+// dictionary and the second not.  `0x80` and above are compressed
+// chunks: the low five bits are the high bits of the uncompressed
+// size, and bits 5 and 6 say which of three things were reset —
+// nothing, the state, the state and the properties, or the state, the
+// properties and the DICTIONARY.
+//
+// AND THE FIRST CHUNK OF A BLOCK MUST RESET THE DICTIONARY.  Without
+// that rule a block could reference bytes from the block before it, and
+// `.xz`'s per-block independence — the thing `pixz` is built on — would
+// not hold.  `XzLzma2NoDictionaryReset` is the refusal, and it is
+// checked at the first chunk rather than discovered at the first match.
+
+use xzerror
+use xzlzma
+
+// The control byte that ends an LZMA2 stream: `0x00`.
+pub const XZ_LZMA2_END = 0x00
+
+// The control byte for an uncompressed chunk that resets the
+// dictionary: `0x01`.
+pub const XZ_LZMA2_UNCOMPRESSED_RESET = 0x01
+
+// The control byte for an uncompressed chunk that does not:
+// `0x02`.
+pub const XZ_LZMA2_UNCOMPRESSED_CONTINUE = 0x02
+
+// The lowest control byte that means a compressed chunk: `0x80`.
+pub const XZ_LZMA2_COMPRESSED_LEAST = 0x80
+
+// The most bytes an uncompressed chunk may hold: 65,536.
+pub const XZ_LZMA2_UNCOMPRESSED_MOST = 65536
+
+// The most uncompressed bytes a compressed chunk may produce: 2,097,152.
+pub const XZ_LZMA2_CHUNK_OUT_MOST = 2097152
+
+// The reset code for a chunk that resets nothing.
+pub const XZ_LZMA2_RESET_NONE = 0
+
+// The reset code for a chunk that resets the LZMA state.
+pub const XZ_LZMA2_RESET_STATE = 1
+
+// The reset code for a chunk that resets the state and reads new
+// properties.
+pub const XZ_LZMA2_RESET_PROPS = 2
+
+// The reset code for a chunk that resets the state, reads new
+// properties and resets the DICTIONARY.
+//
+// Required at the first chunk of every block, which is what makes an
+// `.xz` block independently decodable.
+pub const XZ_LZMA2_RESET_DICT = 3
+
+// One LZMA2 chunk's header, decoded.
+//
+// ```novo
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.read_control(xzlzma2.XZ_LZMA2_END)
+//         Ok(c)  => println("${c.is_end}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzLzma2Chunk
+    // Whether this control byte ends the stream.
+    is_end: Bool
+    // Whether the chunk's payload is stored rather than compressed.
+    is_uncompressed: Bool
+    // Which of the four resets the chunk performs, one of the
+    // `XZ_LZMA2_RESET_*` codes.
+    reset: Int
+    // The uncompressed size the chunk produces, or 0 for an end
+    // marker.  For a compressed chunk the control byte carries its
+    // high five bits and the two bytes after it the rest.
+    uncompressed_size: Int
+    // The compressed size the chunk occupies, or 0 for an end marker.
+    compressed_size: Int
+    // How many bytes the chunk's own header occupied: 1 for an end
+    // marker, 3 for an uncompressed chunk, 5 or 6 for a compressed
+    // one depending on whether it carries a properties byte.
+    header_bytes: Int
+
+// What a control byte means, before its size bytes have been read.
+//
+// `XzBadLzma2Chunk`, which `xzerror.is_corrupt` calls damage, for
+// `0x03` ..= `0x7F`, which the format does not
+// define — the gap between the two uncompressed controls and the
+// compressed range, and the byte a corrupted stream most often lands
+// on.
+//
+// ```novo
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.read_control(0x03)
+//         Ok(_)  => println("0x03 is not a control byte")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_control(control: Int) -> Result<XzLzma2Chunk, XzFault> []
+    todo("xz-nv.xzlzma2.read_control")
+
+// Read a whole chunk header from `src` at `off`.
+//
+// The control byte, the two size bytes, the compressed size for a
+// compressed chunk, and its properties byte where the reset code calls
+// for one.
+//
+// ```novo
+// use std.bytes
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.read_chunk(bytes.zeros(6), 0)
+//         Ok(c)  => println("${c.header_bytes}")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_chunk(src: Bytes, off: Int) -> Result<XzLzma2Chunk, XzFault> []
+    todo("xz-nv.xzlzma2.read_chunk")
+
+// Which reset a control byte performs.
+//
+// `XzBadLzma2Chunk` for a byte that is not a compressed chunk's.
+//
+// ```novo
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.reset_of(0xE0)
+//         Ok(r)  => println("${r}")
+//         Err(e) => println(e.message())
+// ```
+pub fn reset_of(control: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzlzma2.reset_of")
+
+// Whether a chunk carries a properties byte.
+//
+// True for reset codes `XZ_LZMA2_RESET_PROPS` and
+// `XZ_LZMA2_RESET_DICT`.  A chunk that does not carry one keeps the
+// previous chunk's properties, and a stream whose FIRST compressed
+// chunk does not carry one has none to keep — which is
+// `XzBadLzma2Chunk`, and a decoder that let it through would build a
+// probability array of an unknown size.
+//
+// ```novo
+// use xzlzma2
+//
+// fn main() [io]
+//     println("${xzlzma2.carries_properties(xzlzma2.XZ_LZMA2_RESET_DICT)}")
+// ```
+pub fn carries_properties(reset: Int) -> Bool []
+    todo("xz-nv.xzlzma2.carries_properties")
+
+// Whether a chunk resets the dictionary.
+//
+// The predicate the first-chunk rule is written in: a block's first
+// chunk must, so that the block does not reference the block before
+// it, which is what makes an `.xz` block independently decodable.
+//
+// ```novo
+// use xzlzma2
+//
+// fn main() [io]
+//     println("${xzlzma2.resets_dictionary(xzlzma2.XZ_LZMA2_RESET_DICT)}")
+// ```
+pub fn resets_dictionary(reset: Int) -> Bool []
+    todo("xz-nv.xzlzma2.resets_dictionary")
+
+// An LZMA2 decoder between chunks.
+//
+// ```novo
+// use std.bytes
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.decoder(bytes.zeros(65536), bytes.zeros(32768))
+//         Ok(d)  => println("${xzlzma2.produced_of(d)}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzLzma2State
+    // The properties in force, or absent before the first chunk that
+    // carried any.
+    props: ?XzLzmaProps
+    // Whether the dictionary has been reset since the block started.
+    dict_reset: Bool
+    // How many bytes have been produced into the caller's dictionary
+    // buffer.
+    produced: Int
+    // How many source bytes have been consumed.
+    consumed: Int
+    // The caller's dictionary — which is also the output buffer,
+    // because an LZMA match reads from the bytes already produced.
+    dict: Bytes
+    // The caller's probability array.
+    probs: Bytes
+
+// An LZMA2 decoder over a caller's dictionary and probability array.
+//
+// BOTH BUFFERS ARE THE CALLER'S, and they are the only two large
+// allocations an `.xz` decoder makes.  `xzfilter.lzma2_dictionary_bytes`
+// answers the first's size from the block header's one byte, and
+// `xzlzma.probability_bytes` the second's from the properties.  A
+// caller therefore knows what a file will cost before it commits
+// anything.
+//
+// `XzBufferTooSmall` when either is shorter than the sizes those two
+// functions answer.
+//
+// ```novo
+// use std.bytes
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.decoder(bytes.zeros(4096), bytes.zeros(32768))
+//         Ok(d)  => println("${xzlzma2.consumed_of(d)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn decoder(dict: Bytes, probs: Bytes) -> Result<XzLzma2State, XzFault> []
+    todo("xz-nv.xzlzma2.decoder")
+
+// Decode one chunk into the decoder's dictionary.
+//
+// Answers the decoder after it.  `XzLzma2NoDictionaryReset` when the
+// first chunk of a block does not reset the dictionary, and
+// `XzBadLzma2Chunk` for a control byte the format does not define.
+//
+// ```novo
+// use std.bytes
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.decoder(bytes.zeros(4096), bytes.zeros(32768))
+//         Ok(d) =>
+//             match xzlzma2.decode_chunk(d, bytes.zeros(8), 0)
+//                 Ok(d2) => println("${xzlzma2.produced_of(d2)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_chunk(d: XzLzma2State, src: Bytes, off: Int) -> Result<XzLzma2State, XzFault> []
+    todo("xz-nv.xzlzma2.decode_chunk")
+
+// How many bytes the decoder has produced.
+//
+// ```novo
+// use std.bytes
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.decoder(bytes.zeros(4096), bytes.zeros(32768))
+//         Ok(d)  => println("${xzlzma2.produced_of(d)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn produced_of(d: XzLzma2State) -> Int []
+    todo("xz-nv.xzlzma2.produced_of")
+
+// How many source bytes the decoder has consumed.
+//
+// ```novo
+// use std.bytes
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.decoder(bytes.zeros(4096), bytes.zeros(32768))
+//         Ok(d)  => println("${xzlzma2.consumed_of(d)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn consumed_of(d: XzLzma2State) -> Int []
+    todo("xz-nv.xzlzma2.consumed_of")
+
+// The properties in force, or `None` before any chunk carried some.
+//
+// ```novo
+// use std.bytes
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.decoder(bytes.zeros(4096), bytes.zeros(32768))
+//         Ok(d) =>
+//             match xzlzma2.properties_of(d)
+//                 Some(p) => println("${p.lc}")
+//                 None    => println("no chunk has carried properties yet")
+//         Err(e) => println(e.message())
+// ```
+pub fn properties_of(d: XzLzma2State) -> ?XzLzmaProps []
+    todo("xz-nv.xzlzma2.properties_of")
+
+// The bytes a chunk header encodes to, for the encoder release.
+//
+// ```novo
+// use std.bytes
+// use xzlzma2
+//
+// fn main() [io]
+//     match xzlzma2.read_control(xzlzma2.XZ_LZMA2_END)
+//         Ok(c) =>
+//             match xzlzma2.chunk_header_bytes(c)
+//                 Ok(b)  => println("${bytes.len(b)}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn chunk_header_bytes(c: XzLzma2Chunk) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzlzma2.chunk_header_bytes")

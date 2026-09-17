@@ -1,0 +1,315 @@
+// xzcheck.nv — the four integrity checks an `.xz` block may carry, and
+// the one of them nobody else on this registry publishes.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE CHECK TYPE IS A STREAM-LEVEL DECISION AND A BLOCK-LEVEL FIELD.
+// The stream header's flags name one check type for the whole stream;
+// every block then carries a check of that type after its compressed
+// data, padded to a four-byte boundary.  So a decoder knows the check's
+// SIZE before it reads a block, which is what lets it find the next
+// block header without decompressing anything.
+//
+// THREE OF THE FOUR ARE SOMEBODY ELSE'S.  CRC-32 is crc-nv's — the
+// reflected variant, which is the one xz uses, unlike bzip2.  SHA-256
+// is crypto-nv's.  Both are IMPLEMENTED packages, so an xz decoder that
+// verifies is complete the day its own bodies land rather than waiting
+// on two more interface releases.  That is the whole reason they are
+// dependencies here and the compression codecs in other packages on
+// this registry are values a caller hands in: a dependency on an
+// implementation is worth taking, and a dependency on four unimplemented
+// interfaces is a closure a consumer pays for and cannot use.
+//
+// `crc.crc32()` is the algorithm value, fed and finished as a running
+// `Int`; `hashing.sha256` is the digest.  Both are taken by name here
+// rather than reimplemented.
+//
+// THE FOURTH IS THIS PACKAGE'S.  CRC-64/XZ is the ECMA-182 polynomial
+// `0x42F0E1EBA9EA3693`, reflected, initialised and finalised with all
+// ones.  crc-nv 0.1.4 publishes no 64-bit algorithm at all, so it is
+// six functions here and a check value asserted against the catalogue,
+// with the module comment saying why rather than leaving the next
+// reader to wonder.
+//
+// AN UNSUPPORTED CHECK IS NOT A CORRUPT FILE.  The format reserves
+// sixteen check types and defines four; a newer encoder may write one
+// this package does not know.  `size_of` answers the reserved sizes
+// anyway — the format fixes them in groups of four — so a decoder can
+// SKIP a check it cannot verify and still find the next block.
+
+use xzerror
+use crc
+use hashing
+
+// The check type for no check at all: 0x00.
+//
+// Legal, and what `xz --check=none` writes.  A block with it is
+// verified by nothing, which is a decision the caller should be able
+// to see: `xzdec.check_type` is how.
+pub const XZ_CHECK_NONE = 0x00
+
+// The check type for CRC-32: 0x01.  The default `xz` writes.
+pub const XZ_CHECK_CRC32 = 0x01
+
+// The check type for CRC-64: 0x04.  What `xz --check=crc64` writes,
+// and what most `.xz` files built for archival carry.
+pub const XZ_CHECK_CRC64 = 0x04
+
+// The check type for SHA-256: 0x0A.
+pub const XZ_CHECK_SHA256 = 0x0A
+
+// The CRC-64/XZ polynomial, reflected: `0xC96C5795D7870F42`.
+//
+// The reflected form of ECMA-182's `0x42F0E1EBA9EA3693`.  Published
+// beside the check value because the two spellings of the same
+// polynomial are how a port gets this wrong.
+pub const XZ_CRC64_POLY = 0xC96C5795D7870F42
+
+// The catalogue check value for CRC-64/XZ: the CRC of the nine bytes
+// `"123456789"` is `0x995DC9BBDF1939FA`.
+//
+// The one number that settles whether an implementation is this
+// variant, and a caller porting it can assert against it without
+// reading a table.
+pub const XZ_CRC64_CHECK = 0x995DC9BBDF1939FA
+
+// How many bytes a check of type `check` occupies, `0` ..= `64`.
+//
+// Defined for every one of the sixteen types the format reserves, not
+// only the four it defines: types 0x00 is zero bytes, 0x01 to 0x03 are
+// four, 0x04 to 0x06 are eight, and so on in groups of three up to
+// sixty-four.  THAT IS WHAT LETS A DECODER SKIP A CHECK IT CANNOT
+// VERIFY and still find the next block header.
+//
+// `XzBadParameter` for a type outside `0` ..= `15`.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     match xzcheck.size_of(xzcheck.XZ_CHECK_CRC64)
+//         Ok(n)  => println("${n}")
+//         Err(_) => println("not a check type")
+// ```
+pub fn size_of(check: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzcheck.size_of")
+
+// Whether this package can verify a check of that type.
+//
+// True for the four the format defines and false for the twelve it
+// reserves.  A false answer is `XzUnsupportedCheck`, which
+// `xzerror.is_unsupported` separates from damage.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     println("${xzcheck.is_supported(xzcheck.XZ_CHECK_SHA256)}")
+// ```
+pub fn is_supported(check: Int) -> Bool []
+    todo("xz-nv.xzcheck.is_supported")
+
+// A short, stable name for a check type: `"none"`, `"crc32"`,
+// `"crc64"`, `"sha256"`, or `"reserved-N"`.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     println(xzcheck.name_of(xzcheck.XZ_CHECK_CRC32))
+// ```
+pub fn name_of(check: Int) -> Str []
+    todo("xz-nv.xzcheck.name_of")
+
+// A check being computed over a block's content, as the decoder
+// carries it.
+//
+// One value for all four types rather than four types, because the
+// decoder's loop does not care which it is holding — it feeds bytes in
+// and compares at the end — and a caller that does care asks
+// `kind_of`.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     match xzcheck.start(xzcheck.XZ_CHECK_CRC64)
+//         Ok(s)  => println("${xzcheck.kind_of(s)}")
+//         Err(_) => println("not a check type")
+// ```
+pub struct XzCheck
+    // Which of the sixteen types this is.
+    kind: Int
+    // The running 32- or 64-bit register, for the two CRC types.
+    // Zero for the others.
+    crc: Int
+    // The running SHA-256 state's bytes, for `XZ_CHECK_SHA256`.
+    // Empty for the others.
+    digest: Bytes
+    // How many bytes have been fed in, which the decoder compares
+    // against the block header's declared uncompressed size.
+    fed: Int
+
+// A fresh check of a type.
+//
+// `XzUnsupportedCheck` for a reserved type, so a caller that wants to
+// skip one asks `size_of` instead and never builds this.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     match xzcheck.start(xzcheck.XZ_CHECK_NONE)
+//         Ok(s)  => println("${xzcheck.fed_bytes(s)}")
+//         Err(f) => println(f.message())
+// ```
+pub fn start(check: Int) -> Result<XzCheck, XzFault> []
+    todo("xz-nv.xzcheck.start")
+
+// Fold `n` bytes of `src` from `off` into a running check.
+//
+// The streaming entry point: the decoder calls it once per run of
+// output LZMA2 produced, and the state carries across.
+//
+// ```novo
+// use std.bytes
+// use xzcheck
+//
+// fn main() [io]
+//     match xzcheck.start(xzcheck.XZ_CHECK_CRC32)
+//         Ok(s)  => println("${xzcheck.fed_bytes(
+//                       xzcheck.update(s, bytes.from_str("123456789"), 0, 9))}")
+//         Err(_) => println("not a check type")
+// ```
+pub fn update(s: XzCheck, src: Bytes, off: Int, n: Int) -> XzCheck []
+    todo("xz-nv.xzcheck.update")
+
+// The check's final bytes, in the order the file carries them.
+//
+// `size_of(kind_of(s))` bytes long, and little-endian for the two CRC
+// types — which is the byte order the xz format specifies and the
+// opposite of what a reader who assumed network order would write.
+//
+// ```novo
+// use std.bytes
+// use xzcheck
+//
+// fn main() [io]
+//     match xzcheck.start(xzcheck.XZ_CHECK_CRC32)
+//         Ok(s)  => println("${bytes.len(xzcheck.finish(s))}")
+//         Err(_) => println("not a check type")
+// ```
+pub fn finish(s: XzCheck) -> Bytes []
+    todo("xz-nv.xzcheck.finish")
+
+// Which type a running check is.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     match xzcheck.start(xzcheck.XZ_CHECK_CRC64)
+//         Ok(s)  => println(xzcheck.name_of(xzcheck.kind_of(s)))
+//         Err(_) => println("not a check type")
+// ```
+pub fn kind_of(s: XzCheck) -> Int []
+    todo("xz-nv.xzcheck.kind_of")
+
+// How many bytes have been fed into a running check.
+//
+// The decoder compares it against the block header's declared
+// uncompressed size, which is the cheapest of the three agreements a
+// block has to satisfy.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     match xzcheck.start(xzcheck.XZ_CHECK_NONE)
+//         Ok(s)  => println("${xzcheck.fed_bytes(s)}")
+//         Err(_) => println("not a check type")
+// ```
+pub fn fed_bytes(s: XzCheck) -> Int []
+    todo("xz-nv.xzcheck.fed_bytes")
+
+// Whether a finished check equals the bytes the file carried.
+//
+// Compares the full width, in constant time for the SHA-256 case,
+// because an `.xz` used to distribute software is a place where a
+// timing oracle on a digest comparison is worth closing.
+//
+// ```novo
+// use std.bytes
+// use xzcheck
+//
+// fn main() [io]
+//     match xzcheck.start(xzcheck.XZ_CHECK_NONE)
+//         Ok(s)  => println("${xzcheck.matches(s, bytes.zeros(0))}")
+//         Err(_) => println("not a check type")
+// ```
+pub fn matches(s: XzCheck, declared: Bytes) -> Bool []
+    todo("xz-nv.xzcheck.matches")
+
+// A fresh CRC-64/XZ register: all ones.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     println("${xzcheck.crc64_init()}")
+// ```
+pub fn crc64_init() -> Int []
+    todo("xz-nv.xzcheck.crc64_init")
+
+// Fold `n` bytes of `src` from `off` into a CRC-64/XZ register.
+//
+// ```novo
+// use std.bytes
+// use xzcheck
+//
+// fn main() [io]
+//     let s = bytes.from_str("123456789")
+//     println("${xzcheck.crc64_update(xzcheck.crc64_init(), s, 0, 9)}")
+// ```
+pub fn crc64_update(crc: Int, src: Bytes, off: Int, n: Int) -> Int []
+    todo("xz-nv.xzcheck.crc64_update")
+
+// Finish a CRC-64/XZ register: complement it.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     println("${xzcheck.crc64_finish(xzcheck.crc64_init())}")
+// ```
+pub fn crc64_finish(crc: Int) -> Int []
+    todo("xz-nv.xzcheck.crc64_finish")
+
+// The CRC-64/XZ of a whole buffer, the three calls above in one.
+//
+// ```novo
+// use std.bytes
+// use xzcheck
+//
+// fn main() [io]
+//     println("${xzcheck.crc64(bytes.from_str("123456789"))}")
+// ```
+pub fn crc64(data: Bytes) -> Int []
+    todo("xz-nv.xzcheck.crc64")
+
+// One entry of the 256-entry CRC-64/XZ table.
+//
+// Published one entry at a time rather than as a `Bytes` so that a
+// build can compute the two kilobytes into memory at start-up or bake
+// them into read-only storage, and neither choice is forced by the
+// signature.
+//
+// ```novo
+// use xzcheck
+//
+// fn main() [io]
+//     println("${xzcheck.crc64_table_entry(0)}")
+// ```
+pub fn crc64_table_entry(i: Int) -> Int []
+    todo("xz-nv.xzcheck.crc64_table_entry")

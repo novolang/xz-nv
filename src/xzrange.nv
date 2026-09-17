@@ -1,0 +1,262 @@
+// xzrange.nv — the binary range decoder LZMA is built on, as two
+// integers and a caller's probability array.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT A RANGE CODER IS.  An arithmetic coder over single bits.  The
+// decoder holds an interval — `range`, a 32-bit width — and a `code`
+// somewhere inside it.  Each bit is decoded by splitting the interval
+// in proportion to that bit's probability, seeing which half `code`
+// fell in, and then ADAPTING the probability towards the bit that was
+// seen.  Because the split is by probability rather than by half, a bit
+// that is nearly always zero costs far less than one bit.
+//
+// EVERY PROBABILITY IS AN 11-BIT INTEGER AND THERE ARE THOUSANDS OF
+// THEM.  LZMA's model is one array of `Int`, indexed by a context the
+// symbol decoder computes: which state the machine is in, the low bits
+// of the previous byte, the position modulo a power of two.  A
+// dictionary-sized model for `lc = 3, lp = 0` is 12,288 probabilities
+// for the literals alone.
+//
+// SO THE ARRAY IS THE CALLER'S, AND THIS MODULE NEVER OWNS ONE.
+// `decode_bit` takes one probability VALUE and answers the updated one
+// beside the bit; the caller writes it back where it came from.  A
+// range coder that held the array would have to allocate it, which is
+// the largest allocation in the decoder after the dictionary, and would
+// make this module untestable without one.
+//
+// `XzRangeStep` IS A `@value` STRUCT AND ANSWERS A FLAG.  A megabyte of
+// LZMA is some tens of millions of bit decodes, and a `Result` per
+// decode would allocate tens of millions of times.  A `@value` struct
+// cannot be a `Result` payload in v1 anyway; here the two facts point
+// the same way, which is the shape bitstream-nv's `BitTake` settled on
+// for the same reason.
+
+use xzerror
+
+// The width of a probability, in bits: 11.
+pub const XZ_PROB_BITS = 11
+
+// The value a probability is initialised to: 1024, one half.
+//
+// Every probability in the model starts here, at the start of a stream
+// and at every state reset, because before a symbol has been seen
+// there is no reason to favour either bit.
+pub const XZ_PROB_INIT = 1024
+
+// The shift the adaptation uses: 5.
+//
+// A probability moves about a thirty-second of the way towards the bit
+// that was seen.  Slower than a typical adaptive coder, which is what
+// suits LZMA's very long streams.
+pub const XZ_PROB_MOVE_BITS = 5
+
+// The value below which the coder normalises: `1 << 24`.
+pub const XZ_RANGE_TOP = 16777216
+
+// How many bytes a range-coded stream starts with: 5.
+//
+// The first must be zero — a decoder that finds anything else has been
+// handed something that is not an LZMA stream, and it is the cheapest
+// check in the format.
+pub const XZ_RANGE_INIT_BYTES = 5
+
+// A range decoder between bits.
+//
+// A `@value` struct: two integers in the caller's stack frame, no
+// header, no reference count and no allocation.  The inner loop of an
+// LZMA decoder owns one.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     let r = xzrange.start(bytes.zeros(5), 0)
+//     println("${r.ok}")
+// ```
+pub @value
+struct XzRange
+    // The interval's width, `0` ..= `2^32 - 1`.
+    range: Int
+    // Where in the interval the encoded value falls.
+    code: Int
+    // How many bytes of the source have been consumed.
+    consumed: Int
+    // False once the coder has been handed a stream whose first byte
+    // was not zero, or has run out of bytes.  Once false it stays
+    // false.
+    ok: Bool
+
+// Start a range decoder over the five initialisation bytes at `off`.
+//
+// `ok` is false when the first byte is not zero or when there are
+// fewer than five bytes — `start_fault` says which.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     println("${xzrange.start(bytes.zeros(5), 0).consumed}")
+// ```
+pub fn start(src: Bytes, off: Int) -> XzRange []
+    todo("xz-nv.xzrange.start")
+
+// The fault a `start` that answered `ok == false` should be reported
+// as, or `None`.
+//
+// `XzBadRangeCoder` at the offset, which `xzerror.is_corrupt` calls
+// damage.  The bridge between the flag this
+// module answers and the `Result` every entry point above it speaks.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     match xzrange.start_fault(xzrange.start(bytes.zeros(0), 0), 0)
+//         Some(_) => println("not a range-coded stream")
+//         None    => println("started cleanly")
+// ```
+pub fn start_fault(r: XzRange, off: Int) -> ?XzFault []
+    todo("xz-nv.xzrange.start_fault")
+
+// What one bit decode produced.
+//
+// A `@value` struct, for the reason in the module comment: a megabyte
+// of LZMA is tens of millions of these.
+pub @value
+struct XzRangeStep
+    // The coder after the bit.
+    coder: XzRange
+    // The bit, 0 or 1.
+    bit: Int
+    // The probability, ADAPTED towards the bit that was seen.  The
+    // caller writes it back into its own array at the index it read it
+    // from; this module never holds one.
+    prob: Int
+
+// Decode one bit against a probability, and answer the adapted
+// probability beside it.
+//
+// THE FUNCTION THE WHOLE FORMAT IS BUILT ON.  Every literal, every
+// match length, every distance bit and every rep flag in an LZMA
+// stream is a sequence of these.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     let s = xzrange.decode_bit(xzrange.start(bytes.zeros(5), 0),
+//                                xzrange.XZ_PROB_INIT, bytes.zeros(16), 0)
+//     println("${s.bit}")
+// ```
+pub fn decode_bit(r: XzRange, prob: Int, src: Bytes, off: Int) -> XzRangeStep []
+    todo("xz-nv.xzrange.decode_bit")
+
+// Decode `n` bits with no probability model at all, at exactly one bit
+// each.
+//
+// LZMA writes the low bits of a large distance this way, because a
+// distance's low bits are very nearly uniform and modelling them would
+// cost more table than it saved.  `n` is `1` ..= `32`.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     let s = xzrange.decode_direct(xzrange.start(bytes.zeros(5), 0), 4,
+//                                   bytes.zeros(16), 0)
+//     println("${s.bit}")
+// ```
+pub fn decode_direct(r: XzRange, n: Int, src: Bytes, off: Int) -> XzRangeStep []
+    todo("xz-nv.xzrange.decode_direct")
+
+// Decode a bit tree of `n` levels: `n` bit decodes against `2^n`
+// probabilities, answering the symbol.
+//
+// The shape LZMA uses for a literal's eight bits, for a length's low
+// bits and for a distance's slot.  `probs` is the caller's array and
+// `at` the index of the tree's first probability; the tree's
+// probabilities are updated in place.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     let s = xzrange.decode_tree(xzrange.start(bytes.zeros(5), 0), 3,
+//                                 bytes.zeros(64), 0, bytes.zeros(16), 0)
+//     println("${s.bit}")
+// ```
+pub fn decode_tree(r: XzRange, n: Int, probs: Bytes, at: Int, src: Bytes,
+                   off: Int) -> XzRangeStep []
+    todo("xz-nv.xzrange.decode_tree")
+
+// The same tree, read in reverse bit order.
+//
+// LZMA reads a distance's aligned low bits this way, and it is a
+// separate function rather than a flag because a decoder that used the
+// wrong one produces plausible, wrong output rather than an error.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     let s = xzrange.decode_tree_reverse(xzrange.start(bytes.zeros(5), 0), 4,
+//                                         bytes.zeros(64), 0, bytes.zeros(16), 0)
+//     println("${s.bit}")
+// ```
+pub fn decode_tree_reverse(r: XzRange, n: Int, probs: Bytes, at: Int, src: Bytes,
+                           off: Int) -> XzRangeStep []
+    todo("xz-nv.xzrange.decode_tree_reverse")
+
+// A probability adapted towards a bit, without decoding anything.
+//
+// Published so a test can assert the adaptation rule on its own — it
+// is three lines and two of them are shifts, and every port gets one
+// of the two directions wrong at least once.
+//
+// ```novo
+// use xzrange
+//
+// fn main() [io]
+//     println("${xzrange.adapt(xzrange.XZ_PROB_INIT, 0)}")
+// ```
+pub fn adapt(prob: Int, bit: Int) -> Int []
+    todo("xz-nv.xzrange.adapt")
+
+// Whether a finished coder is in the state a well-formed stream leaves
+// it in: `code` exactly zero.
+//
+// LZMA2 does not rely on this, because its chunks carry their own
+// sizes, but the legacy `.lzma` container with an unknown size does —
+// and a decoder that skipped the check would read past the end of a
+// truncated file.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     println("${xzrange.is_clean(xzrange.start(bytes.zeros(5), 0))}")
+// ```
+pub fn is_clean(r: XzRange) -> Bool []
+    todo("xz-nv.xzrange.is_clean")
+
+// How many bytes of the source a coder has consumed.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     println("${xzrange.consumed_of(xzrange.start(bytes.zeros(5), 0))}")
+// ```
+pub fn consumed_of(r: XzRange) -> Int []
+    todo("xz-nv.xzrange.consumed_of")

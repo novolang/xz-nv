@@ -1,0 +1,72 @@
+[package]
+name        = "xz-nv"
+version     = "0.0.1"
+description = "xz and LZMA2, decoder first, with nothing performed: a feed-and-drain decoder over the whole container — the stream header and footer with their duplicated flags, block headers and their optional binding sizes, the index that makes an .xz seekable, and CRC-32, CRC-64 and SHA-256 as the integrity checks — over LZMA2's chunk layer, LZMA1's range coder and twelve-state context model, the delta filter and all eight branch converters, and the legacy .lzma container read.  The dictionary and the probability array are the caller's, sized from the block header before anything is committed.  The encoder is declared single-threaded with a greedy match finder, and the README says so rather than implying otherwise.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  An LZMA decoder is a range coder, a probability array and a
+# dictionary — arithmetic over bytes the caller already holds.  Nothing
+# is read, nothing is written, and the one function that takes a stream
+# binds its cost rather than spending one:
+# `xzdec.read_all<S: Read[e]>(…) -> … [e]` is charged whatever the
+# caller's impl supplies (SPEC § 5.6).
+#
+# The two large buffers are the caller's, because they are the only two
+# an `.xz` decoder needs and both are sized by the file:
+# `xzfilter.lzma2_dictionary_bytes` answers the dictionary's size from
+# the block header's one byte, `xzlzma.probability_bytes` answers the
+# model's from the properties byte, and `xzlzma2.decoder` takes both
+# rather than allocating either.
+#
+# No device claim.  `xz -9` asks for a 64 MiB dictionary and even
+# preset 0 asks for 256 KiB, on top of a 28 KiB probability array; that
+# is not a microcontroller's memory, so there is no
+# `tests/embedded_probe.nv` here — the same decision zstd-nv made for
+# the same reason.
+layer       = "core"
+
+category    = "compression"
+
+tags        = ["xz", "lzma", "lzma2", "compression", "decompression", "bcj", "delta", "sans-io"]
+repository  = "https://github.com/novolang/xz-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Decoding an xz stream without touching a stream"
+
+[dependencies]
+# crc-nv, for the CRC-32 that checksums an xz stream header, every
+# block header and the index — and for the CRC-32 an `.xz` block may
+# carry as its integrity check.  It is the REFLECTED variant, which is
+# the one crc-nv 0.1.4 publishes as `crc.crc32()` with its check value
+# asserted, so the row is not missing and this package takes it.
+#
+# (bzip2's CRC is the UNREFLECTED variant of the same polynomial and
+# cannot use this.  That package owns its own and says why.)
+crc-nv = "^0.1"
+
+# crypto-nv, for the SHA-256 an `.xz` block may carry as its integrity
+# check — what `xz --check=sha256` writes.
+#
+# WHY THESE TWO ARE DEPENDENCIES WHERE ANOTHER PACKAGE'S CODECS ARE
+# VALUES A CALLER HANDS IN: both of these are IMPLEMENTED releases, so
+# an xz decoder that verifies is complete the day its own bodies land.
+# A dependency on an implementation is worth taking; a dependency on an
+# unimplemented interface is a closure a consumer pays for and cannot
+# use.
+#
+# The third check the format defines, CRC-64/XZ, has no row on the
+# registry at all — crc-nv 0.1.4 publishes no 64-bit algorithm — so
+# `xzcheck` owns it, with its catalogue check value asserted.
+crypto-nv = "^0.1"

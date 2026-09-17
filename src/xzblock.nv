@@ -1,0 +1,214 @@
+// xzblock.nv — a block header, its filter chain, and the three sizes a
+// block has to agree with itself about.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// A BLOCK HEADER STARTS WITH ITS OWN SIZE, and that byte is also how a
+// decoder tells a block from the index: a first byte of zero is the
+// index indicator, and any other value is `(size / 4) - 1` for a block
+// header of four to 1024 bytes.  So the very first byte after a
+// block's padding answers "is there another block, or is this the
+// table of contents", with no look-ahead.
+//
+// THE TWO SIZE FIELDS ARE OPTIONAL AND BINDING.  A block header may
+// declare its compressed size, its uncompressed size, both or neither.
+// Where a field is present the decoder must check it, and a block that
+// produced a different number is `XzSizeMismatch` — not a warning.
+// Where it is absent the decoder finds the end from the filter chain.
+// `xz` writes both when it can, which is what makes a block
+// individually decodable and is the whole basis of `pixz`'s parallel
+// decompression.
+//
+// THE FILTER CHAIN IS AT MOST FOUR FILTERS AND THE LAST IS THE
+// COMPRESSOR.  A chain is applied in order on the way out and in
+// reverse on the way in, so the decoder reads the LAST filter's output
+// first.  The format's rules are few and every one of them is a way a
+// file can be malformed: at most four filters, exactly one of them a
+// compression filter, that one last, and no branch converter twice.
+//
+// THE HEADER CHECKSUMS ITSELF, like the stream header, so a damaged
+// header is distinguishable from a header that asks for something this
+// package does not implement.
+
+use xzerror
+use xzfilter
+
+// The smallest a block header may be: 8 bytes.
+pub const XZ_BLOCK_HEADER_BYTES_LEAST = 8
+
+// The largest a block header may be: 1024 bytes.
+//
+// The size byte encodes `(size / 4) - 1`, so 255 means 1024.
+pub const XZ_BLOCK_HEADER_BYTES_MOST = 1024
+
+// The first byte that means "this is the index, not another block": 0.
+pub const XZ_INDEX_INDICATOR = 0x00
+
+// The most filters a chain may hold: 4.
+pub const XZ_FILTERS_MOST = 4
+
+// A block header.
+//
+// ```novo
+// use xzblock
+//
+// fn main() [io]
+//     println("${xzblock.header([], -1, -1).filters}")
+// ```
+pub struct XzBlockHeader
+    // The filter chain, in the order the encoder applied it.  A
+    // decoder runs it in reverse.
+    filters: [XzFilter]
+    // The compressed size the header declares, or `-1` when the field
+    // is absent.  Present means BINDING: a block that consumed a
+    // different number is `XzSizeMismatch`.
+    compressed_size: Int
+    // The uncompressed size the header declares, or `-1` when absent.
+    // Binding on the same terms.
+    uncompressed_size: Int
+
+// A block header from a chain and its two optional sizes.
+//
+// The chain is built with `xzfilter.delta`, `xzfilter.branch` and
+// `xzfilter.lzma2`, and checked with `xzfilter.check_chain`.
+//
+// `-1` for a size means the field is absent.  `XzBadFilterChain` when
+// the chain breaks one of the format's four rules.
+//
+// ```novo
+// use xzblock
+//
+// fn main() [io]
+//     println("${xzblock.header([], -1, -1).compressed_size}")
+// ```
+pub fn header(filters: [XzFilter], compressed: Int, uncompressed: Int) -> XzBlockHeader []
+    todo("xz-nv.xzblock.header")
+
+// What the first byte after a block's padding means.
+//
+// Answers `0` for the index indicator and the block header's size in
+// bytes otherwise.  THE CALL THAT DECIDES WHETHER THERE IS ANOTHER
+// BLOCK, with no look-ahead and no back-tracking.
+//
+// ```novo
+// use xzblock
+//
+// fn main() [io]
+//     println("${xzblock.header_size_from(xzblock.XZ_INDEX_INDICATOR)}")
+// ```
+pub fn header_size_from(first: Int) -> Int []
+    todo("xz-nv.xzblock.header_size_from")
+
+// Read a block header from `src` at `off`.
+//
+// `XzBadBlockHeader` for a size byte or a flags byte the format does
+// not allow — `xzerror.is_corrupt` answers true for it, and
+// `xzerror.is_unsupported` for the filter case below — `XzHeaderCrcMismatch` for a damaged header,
+// `XzUnsupportedFilter` for a filter ID this package does not
+// implement, and `XzBadFilterChain` for a chain that breaks a rule.
+//
+// ```novo
+// use std.bytes
+// use xzblock
+//
+// fn main() [io]
+//     match xzblock.read_header(bytes.zeros(12), 0)
+//         Ok(h)  => println("${h.compressed_size}")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_header(src: Bytes, off: Int) -> Result<XzBlockHeader, XzFault> []
+    todo("xz-nv.xzblock.read_header")
+
+// The bytes a block header encodes to, padded to a multiple of four
+// and checksummed.
+//
+// ```novo
+// use std.bytes
+// use xzblock
+//
+// fn main() [io]
+//     match xzblock.header_bytes(xzblock.header([], -1, -1))
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn header_bytes(h: XzBlockHeader) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzblock.header_bytes")
+
+// Whether a block header declares its compressed size.
+//
+// The question `pixz` asks of every block: a block with both sizes
+// declared can be decoded on its own, in parallel with its
+// neighbours, without reading anything before it.
+//
+// ```novo
+// use xzblock
+//
+// fn main() [io]
+//     println("${xzblock.has_compressed_size(xzblock.header([], -1, -1))}")
+// ```
+pub fn has_compressed_size(h: XzBlockHeader) -> Bool []
+    todo("xz-nv.xzblock.has_compressed_size")
+
+// Whether a block header declares its uncompressed size.
+//
+// ```novo
+// use xzblock
+//
+// fn main() [io]
+//     println("${xzblock.has_uncompressed_size(xzblock.header([], -1, 64))}")
+// ```
+pub fn has_uncompressed_size(h: XzBlockHeader) -> Bool []
+    todo("xz-nv.xzblock.has_uncompressed_size")
+
+// Check a block's actual sizes against what its header declared.
+//
+// `XzSizeMismatch` carrying the declared number and the actual one.  A
+// field that was absent is not checked, which is the whole of the
+// optionality: absent means "find the end from the filter chain", not
+// "any size will do".
+//
+// ```novo
+// use xzblock
+//
+// fn main() [io]
+//     match xzblock.check_sizes(xzblock.header([], -1, -1), 40, 100)
+//         Ok(_)  => println("both fields absent, so nothing to disagree with")
+//         Err(e) => println(e.message())
+// ```
+pub fn check_sizes(h: XzBlockHeader, compressed: Int, uncompressed: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzblock.check_sizes")
+
+// The unpadded size a block of these dimensions contributes to the
+// index.
+//
+// The header's bytes, plus the compressed data, plus the check —
+// WITHOUT the block padding.  The index records this number rather
+// than the padded one because the padding is derivable and the format
+// declines to store what it can compute.
+//
+// `XzBadParameter` for a negative argument.
+//
+// ```novo
+// use xzblock
+//
+// fn main() [io]
+//     match xzblock.unpadded_size(12, 100, 4)
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn unpadded_size(header_bytes_len: Int, compressed: Int,
+                     check_bytes: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzblock.unpadded_size")
+
+// How many bytes of block padding follow compressed data of `n` bytes:
+// `0` ..= `3`.
+//
+// ```novo
+// use xzblock
+//
+// fn main() [io]
+//     println("${xzblock.padding_after(5)}")
+// ```
+pub fn padding_after(n: Int) -> Int []
+    todo("xz-nv.xzblock.padding_after")

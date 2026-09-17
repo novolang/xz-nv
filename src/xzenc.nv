@@ -1,0 +1,312 @@
+// xzenc.nv — the encoder, declared now and implemented later.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THE ENCODER IS DECLARED AND NOT BUILT.  The decoder has an
+// oracle: the xz format specification says what a stream means, and
+// the reference implementation's test files say whether this one
+// agrees, file by file.  An encoder has no such target.  Any stream
+// the reference decoder reads is a CORRECT stream; whether it is a
+// GOOD one is a question about ratio, and the reference answers it
+// with a binary-tree match finder, an optimal parser that costs every
+// candidate against the adaptive model's own current probabilities,
+// and a price table that is recomputed as the model moves.  That is
+// the release, not an afternoon.
+//
+// WHAT THIS ENCODER WILL AND WILL NOT DO, in the signatures rather
+// than in a footnote:
+//
+//   Threads          one.  Nothing here spawns anything, so the
+//                    blocks are sequential; `xz -T0`'s parallelism is
+//                    a host concern and this package has no effects.
+//   Match finder     one hash chain, greedy.  Not a binary tree, and
+//                    no optimal parsing.
+//   Filters          all ten, both directions.  A filter is
+//                    reversible arithmetic and has no ratio question
+//                    in it, so there is nothing here to get subtly
+//                    worse than the reference.
+//   Presets          the nine levels map to a dictionary size and a
+//                    chain depth, and nothing else.  `xz -9e`'s extra
+//                    pass has no counterpart.
+//   Container        `.xz` only.  The legacy `.lzma` container is
+//                    read and never written.
+//
+// A CALLER ASKING FOR LEVEL 9 GETS A VALID `.xz` THAT IS MEASURABLY
+// LARGER THAN `xz -9`'s.  Saying so here is cheaper than letting
+// somebody discover it from a file size.
+
+use xzerror
+use xzcheck
+use xzfilter
+
+// The lowest preset: 0.
+pub const XZ_PRESET_LEAST = 0
+
+// The highest preset: 9.
+pub const XZ_PRESET_MOST = 9
+
+// The preset `xz` uses when told nothing: 6.
+pub const XZ_PRESET_DEFAULT = 6
+
+// An encoder's settings.
+//
+// A value a caller builds once and names, rather than six optional
+// arguments with a compression decision in each of their defaults.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s)  => println("${s.preset}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzSettings
+    // The preset, `0` ..= `9`.
+    preset: Int
+    // The filter chain to apply, ending in LZMA2.
+    filters: [XzFilter]
+    // The check type every block will carry.
+    check: Int
+    // How many uncompressed bytes go in one block, or `-1` for one
+    // block covering everything.
+    //
+    // SETTING IT IS WHAT MAKES THE OUTPUT SEEKABLE.  A single-block
+    // `.xz` has an index with one record in it, which says how large
+    // the file is and nothing else useful; a file written in 16 MiB
+    // blocks can be decoded from any of them.
+    block_bytes: Int
+
+// Settings for a preset, with the default chain and CRC-64.
+//
+// `XzBadParameter` for a preset outside `0` ..= `9`.  Neither
+// `xzerror.is_corrupt` nor `xzerror.is_unsupported` answers true for
+// it: a preset of twelve is this program's mistake and not a file's.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(9)
+//         Ok(s)  => println("${s.check}")
+//         Err(e) => println(e.message())
+// ```
+pub fn settings(preset: Int) -> Result<XzSettings, XzFault> []
+    todo("xz-nv.xzenc.settings")
+
+// The same settings with a different check type.
+//
+// ```novo
+// use xzenc
+// use xzcheck
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s)  => println("${xzenc.with_check(s, xzcheck.XZ_CHECK_CRC32).check}")
+//         Err(e) => println(e.message())
+// ```
+pub fn with_check(s: XzSettings, check: Int) -> XzSettings []
+    todo("xz-nv.xzenc.with_check")
+
+// The same settings with a filter chain of the caller's.
+//
+// `xzfilter.check_chain` decides, and `XzBadFilterChain` names which
+// of the format's rules broke.  Checked here rather than at the first
+// block so that a caller is told
+// at configuration time.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s) =>
+//             match xzenc.with_filters(s, [])
+//                 Ok(_)  => println("an empty chain has no compression filter")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn with_filters(s: XzSettings, filters: [XzFilter]) -> Result<XzSettings, XzFault> []
+    todo("xz-nv.xzenc.with_filters")
+
+// The same settings with a block size, which is what makes the output
+// seekable.
+//
+// `-1` for one block covering everything.  `XzBadParameter` for a
+// positive size below 4096.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s) =>
+//             match xzenc.with_block_bytes(s, 16777216)
+//                 Ok(s2) => println("${s2.block_bytes}")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn with_block_bytes(s: XzSettings, n: Int) -> Result<XzSettings, XzFault> []
+    todo("xz-nv.xzenc.with_block_bytes")
+
+// The dictionary size a preset asks for, in bytes.
+//
+// 256 KiB at preset 0 up to 64 MiB at preset 9.  Published because it
+// is what the preset actually CHANGES, and because it is a demand on
+// whoever decodes the result rather than on whoever wrote it.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.dictionary_bytes_for(9)
+//         Ok(n)  => println("${n}")
+//         Err(e) => println(e.message())
+// ```
+pub fn dictionary_bytes_for(preset: Int) -> Result<Int, XzFault> []
+    todo("xz-nv.xzenc.dictionary_bytes_for")
+
+// An encoder between pushes.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s)  => println("${xzenc.total_in(xzenc.encoder(s))}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzEncoder
+    // The settings this encoder was built with.
+    settings: XzSettings
+    // Content bytes taken so far.
+    taken: Int
+    // Compressed bytes written so far.
+    written: Int
+    // How many blocks have been closed.
+    blocks: Int
+    // Whether the stream header has been written.
+    started: Bool
+
+// An encoder for a set of settings.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s)  => println("${xzenc.blocks_written(xzenc.encoder(s))}")
+//         Err(e) => println(e.message())
+// ```
+pub fn encoder(s: XzSettings) -> XzEncoder []
+    todo("xz-nv.xzenc.encoder")
+
+// Give the encoder more content, and take whatever compressed bytes it
+// completed.
+//
+// The mirror of `xzdec.feed`: nothing comes back until a block fills,
+// and then a whole block at once.
+//
+// ```novo
+// use std.bytes
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s) =>
+//             let (e, out) = xzenc.push(xzenc.encoder(s), bytes.from_str("hello"))
+//             println("${bytes.len(out)} ${xzenc.total_in(e)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn push(e: XzEncoder, chunk: Bytes) -> (XzEncoder, Bytes) []
+    todo("xz-nv.xzenc.push")
+
+// Close the stream: the last block, the index and the footer.
+//
+// ```novo
+// use std.bytes
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s) =>
+//             match xzenc.close(xzenc.encoder(s))
+//                 Ok(b)  => println("${bytes.len(b)} byte(s)")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn close(e: XzEncoder) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzenc.close")
+
+// Content bytes the encoder has taken.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s)  => println("${xzenc.total_in(xzenc.encoder(s))}")
+//         Err(e) => println(e.message())
+// ```
+pub fn total_in(e: XzEncoder) -> Int []
+    todo("xz-nv.xzenc.total_in")
+
+// How many blocks the encoder has closed.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(6)
+//         Ok(s)  => println("${xzenc.blocks_written(xzenc.encoder(s))}")
+//         Err(e) => println(e.message())
+// ```
+pub fn blocks_written(e: XzEncoder) -> Int []
+    todo("xz-nv.xzenc.blocks_written")
+
+// Compress a whole buffer at the default preset.
+//
+// ```novo
+// use std.bytes
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.compress(bytes.from_str("hello"))
+//         Ok(b)  => println("${bytes.len(b)} byte(s)")
+//         Err(e) => println(e.message())
+// ```
+pub fn compress(data: Bytes) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzenc.compress")
+
+// Compress a whole buffer with settings of the caller's.
+//
+// ```novo
+// use std.bytes
+// use xzenc
+//
+// fn main() [io]
+//     match xzenc.settings(1)
+//         Ok(s) =>
+//             match xzenc.compress_with(bytes.from_str("hello"), s)
+//                 Ok(b)  => println("${bytes.len(b)} byte(s)")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn compress_with(data: Bytes, s: XzSettings) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzenc.compress_with")
+
+// The largest output `n` bytes of content can compress to.
+//
+// `.xz` can EXPAND incompressible input — the container alone is
+// fifty-odd bytes — and a caller sizing a buffer needs the worst case
+// rather than a hope.
+//
+// ```novo
+// use xzenc
+//
+// fn main() [io]
+//     println("${xzenc.compress_bound(1048576)}")
+// ```
+pub fn compress_bound(n: Int) -> Int []
+    todo("xz-nv.xzenc.compress_bound")

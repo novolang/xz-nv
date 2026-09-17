@@ -1,0 +1,253 @@
+// xzstream.nv — the twelve bytes at the front and the twelve at the
+// back, and why the format writes the flags twice.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// AN `.xz` FILE IS A SEQUENCE OF STREAMS, with four-byte-aligned zero
+// padding allowed between them.  Concatenation is the format's own
+// multi-file convention, and `xz --block-list` and `pixz` both produce
+// files that use it, so a decoder that stopped after the first footer
+// would silently truncate them.
+//
+// A STREAM IS HEADER, BLOCKS, INDEX, FOOTER, and the footer is what
+// makes an `.xz` seekable: it carries the size of the index, so a
+// reader that can seek jumps to twelve bytes before the end, reads
+// backwards to the index, and has a table of contents without touching
+// a single compressed byte.
+//
+// THE FLAGS ARE WRITTEN TWICE ON PURPOSE.  The two stream-flag bytes
+// appear in the header and again in the footer, and the format requires
+// them to be equal.  That is not redundancy for its own sake: it is
+// what catches a file that was truncated and had another file's tail
+// appended, which is the failure mode of a naive resume-a-download.
+//
+// AND THE HEADER CHECKSUMS ITSELF.  A CRC-32 over the two flag bytes
+// sits in both places, so a decoder can tell "this is not an xz file"
+// from "this is an xz file whose first twelve bytes are damaged" — a
+// distinction a caller sniffing an unknown archive actually acts on.
+
+use xzerror
+
+// The six magic bytes an `.xz` stream starts with:
+// `FD 37 7A 58 5A 00`.
+//
+// The first byte has its high bit set and the next four spell `7zXZ`,
+// so the file is recognisable as binary to a tool that samples the
+// first byte and recognisable as xz to a person with a hex dump.
+pub const XZ_HEADER_MAGIC_BYTES = 6
+
+// The two magic bytes an `.xz` stream ends with: `59 5A`, `YZ`.
+pub const XZ_FOOTER_MAGIC_BYTES = 2
+
+// The whole stream header's size: 12 bytes.
+//
+// Six of magic, two of flags, four of CRC-32 over the flags.
+pub const XZ_HEADER_BYTES = 12
+
+// The whole stream footer's size: 12 bytes.
+//
+// Four of CRC-32, four of backward size, two of flags, two of magic.
+// The same size as the header, which is what lets a seeking reader
+// take the last twelve bytes without knowing anything else.
+pub const XZ_FOOTER_BYTES = 12
+
+// A stream's flags: the check type the whole stream uses.
+//
+// Two bytes in the file.  The first is reserved and must be zero; the
+// low four bits of the second are the check type and the top four are
+// reserved.
+//
+// ```novo
+// use xzstream
+// use xzcheck
+//
+// fn main() [io]
+//     match xzstream.flags(xzcheck.XZ_CHECK_CRC64)
+//         Ok(f)  => println("${f.check}")
+//         Err(_) => println("not a check type")
+// ```
+pub struct XzStreamFlags
+    // The check type every block in this stream carries, one of
+    // `xzcheck.XZ_CHECK_*` or a reserved value.
+    check: Int
+
+// Stream flags for a check type.
+//
+// `XzBadParameter` for a type outside `0` ..= `15`.  A RESERVED type
+// is accepted here — the flags are what a file says, and refusing one
+// at construction would make an unsupported-check file unreadable
+// rather than merely unverifiable.
+//
+// ```novo
+// use xzstream
+// use xzcheck
+//
+// fn main() [io]
+//     match xzstream.flags(xzcheck.XZ_CHECK_NONE)
+//         Ok(f)  => println("${f.check}")
+//         Err(e) => println(e.message())
+// ```
+pub fn flags(check: Int) -> Result<XzStreamFlags, XzFault> []
+    todo("xz-nv.xzstream.flags")
+
+// An `.xz` stream header, read from the first twelve bytes.
+//
+// ```novo
+// use std.bytes
+// use xzstream
+//
+// fn main() [io]
+//     match xzstream.read_header(bytes.zeros(12))
+//         Ok(h)  => println("${h.flags.check}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzStreamHeader
+    // The flags this stream declares.
+    flags: XzStreamFlags
+
+// Read a stream header from the first twelve bytes of `src` at `off`.
+//
+// `XzBadMagic` when the six magic bytes are wrong — the file is not
+// `.xz` at all, and `xzerror.is_corrupt` answers true for it.  `XzHeaderCrcMismatch` when they are right and the
+// CRC over the flags is not: the file IS `.xz` and its first twelve
+// bytes are damaged, which is a different thing to tell a user.
+// `XzReservedBitSet` when a reserved bit is set.
+//
+// ```novo
+// use std.bytes
+// use xzstream
+//
+// fn main() [io]
+//     match xzstream.read_header(bytes.zeros(12))
+//         Ok(h)  => println("${h.flags.check}")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_header(src: Bytes) -> Result<XzStreamHeader, XzFault> []
+    todo("xz-nv.xzstream.read_header")
+
+// The twelve bytes a stream header is, for a given set of flags.
+//
+// ```novo
+// use std.bytes
+// use xzstream
+// use xzcheck
+//
+// fn main() [io]
+//     match xzstream.flags(xzcheck.XZ_CHECK_CRC32)
+//         Ok(f)  => println("${bytes.len(xzstream.header_bytes(f))}")
+//         Err(_) => println("not a check type")
+// ```
+pub fn header_bytes(f: XzStreamFlags) -> Bytes []
+    todo("xz-nv.xzstream.header_bytes")
+
+// An `.xz` stream footer.
+//
+// ```novo
+// use std.bytes
+// use xzstream
+//
+// fn main() [io]
+//     match xzstream.read_footer(bytes.zeros(12))
+//         Ok(f)  => println("${f.index_bytes}")
+//         Err(e) => println(e.message())
+// ```
+pub struct XzStreamFooter
+    // The flags, which must equal the header's.
+    flags: XzStreamFlags
+    // How many bytes the index occupies, decoded from the footer's
+    // four-byte backward-size field.
+    //
+    // THE FIELD THAT MAKES AN `.xz` SEEKABLE.  Stored as
+    // `(size / 4) - 1` so that four bytes reach 16 GiB of index; this
+    // is the decoded byte count, so a caller never does the
+    // arithmetic.
+    index_bytes: Int
+
+// Read a stream footer from twelve bytes of `src` at `off`.
+//
+// `XzBadFooterMagic` when the last two bytes are not `YZ`, and
+// `XzHeaderCrcMismatch` when the CRC over the backward size and the
+// flags does not match.
+//
+// ```novo
+// use std.bytes
+// use xzstream
+//
+// fn main() [io]
+//     match xzstream.read_footer(bytes.zeros(12))
+//         Ok(f)  => println("${f.index_bytes}")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_footer(src: Bytes) -> Result<XzStreamFooter, XzFault> []
+    todo("xz-nv.xzstream.read_footer")
+
+// The twelve bytes a stream footer is.
+//
+// `XzBadParameter` when `index_bytes` is not a positive multiple of
+// four, which is the only thing the backward-size field can encode.
+//
+// ```novo
+// use std.bytes
+// use xzstream
+// use xzcheck
+//
+// fn main() [io]
+//     match xzstream.flags(xzcheck.XZ_CHECK_CRC32)
+//         Ok(f) =>
+//             match xzstream.footer_bytes(f, 4)
+//                 Ok(b)  => println("${bytes.len(b)}")
+//                 Err(e) => println(e.message())
+//         Err(_) => println("not a check type")
+// ```
+pub fn footer_bytes(f: XzStreamFlags, index_bytes: Int) -> Result<Bytes, XzFault> []
+    todo("xz-nv.xzstream.footer_bytes")
+
+// Whether a header's flags and a footer's agree.
+//
+// THE CHECK THAT CATCHES A TRUNCATED-AND-REAPPENDED FILE, which is the
+// failure mode of a naive resume-a-download, and the reason the format
+// writes the two bytes twice.  `XzFlagsMismatch` when they do not.
+//
+// ```novo
+// use xzstream
+// use xzcheck
+//
+// fn main() [io]
+//     match xzstream.flags(xzcheck.XZ_CHECK_CRC32)
+//         Ok(f)  => println("${xzstream.flags_agree(f, f)}")
+//         Err(_) => println("not a check type")
+// ```
+pub fn flags_agree(header: XzStreamFlags, footer: XzStreamFlags) -> Bool []
+    todo("xz-nv.xzstream.flags_agree")
+
+// The check type a stream declares, as a number.
+//
+// ```novo
+// use std.bytes
+// use xzstream
+// use xzcheck
+//
+// fn main() [io]
+//     match xzstream.read_header(bytes.zeros(12))
+//         Ok(h)  => println(xzcheck.name_of(xzstream.check_of(h)))
+//         Err(e) => println(e.message())
+// ```
+pub fn check_of(h: XzStreamHeader) -> Int []
+    todo("xz-nv.xzstream.check_of")
+
+// How many bytes of stream padding follow a stream that ended at
+// `offset`: `0` ..= `3`.
+//
+// Streams in a concatenated `.xz` are separated by zeroes to a
+// four-byte boundary, and the next stream's magic starts on it.  A
+// caller scanning for a second stream needs exactly this number.
+//
+// ```novo
+// use xzstream
+//
+// fn main() [io]
+//     println("${xzstream.padding_after(13)}")
+// ```
+pub fn padding_after(offset: Int) -> Int []
+    todo("xz-nv.xzstream.padding_after")

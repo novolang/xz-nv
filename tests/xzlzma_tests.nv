@@ -1,0 +1,283 @@
+// xzlzma_tests.nv — the range coder, LZMA1's context model and the
+// legacy container, and LZMA2's chunk layer.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// xz-nv.<module>.<fn>`.
+
+use std.test
+use std.bytes
+use xzerror
+use xzlzma
+use xzlzma2
+use xzrange
+
+@test
+fn test_the_range_coder_is_two_integers_and_a_callers_array() [io]
+    test.case("a stream starts with five bytes and the first must be zero")
+    test.assert(xzrange.XZ_RANGE_INIT_BYTES == 5)
+    let r = xzrange.start(bytes.zeros(5), 0)
+    test.assert(r.ok and xzrange.consumed_of(r) == 5)
+
+    test.case("a first byte that is not zero is not an LZMA stream")
+    let bad = xzrange.start(bytes.from_str("\u{01}\u{00}\u{00}\u{00}\u{00}"), 0)
+    test.assert(not bad.ok)
+    match xzrange.start_fault(bad, 0)
+        Some(f) => test.assert(xzerror.kind_name(f.kind) == "bad-range-coder")
+        None    => test.fail("a non-zero first byte is refused")
+
+    test.case("and fewer than five bytes is the same flag")
+    test.assert(not xzrange.start(bytes.zeros(0), 0).ok)
+
+@test
+fn test_a_probability_is_eleven_bits_and_adapts_towards_what_was_seen() [io]
+    test.case("every probability starts at one half")
+    test.assert(xzrange.XZ_PROB_BITS == 11)
+    test.assert(xzrange.XZ_PROB_INIT == 1024)
+    test.assert(xzrange.XZ_PROB_INIT == (1 << (xzrange.XZ_PROB_BITS - 1)))
+
+    test.case("a zero bit raises the probability of zero, a one lowers it")
+    test.assert(xzrange.adapt(xzrange.XZ_PROB_INIT, 0) > xzrange.XZ_PROB_INIT)
+    test.assert(xzrange.adapt(xzrange.XZ_PROB_INIT, 1) < xzrange.XZ_PROB_INIT)
+
+    test.case("and it moves about a thirty-second of the way")
+    test.assert(xzrange.XZ_PROB_MOVE_BITS == 5)
+
+    test.case("the coder normalises below 2^24")
+    test.assert(xzrange.XZ_RANGE_TOP == 16777216)
+
+@test
+fn test_every_decode_form_answers_a_value_struct_and_never_allocates() [io]
+    // A megabyte of LZMA is tens of millions of bit decodes.
+    let r = xzrange.start(bytes.zeros(5), 0)
+
+    test.case("one bit against one probability")
+    let b = xzrange.decode_bit(r, xzrange.XZ_PROB_INIT, bytes.zeros(16), 0)
+    test.assert(b.bit == 0 or b.bit == 1)
+    test.assert(b.prob > 0)
+
+    test.case("direct bits, with no model at all — a large distance's low bits")
+    test.assert(xzrange.decode_direct(r, 4, bytes.zeros(16), 0).bit >= 0)
+
+    test.case("a bit tree, which is how a literal's eight bits are read")
+    test.assert(xzrange.decode_tree(r, 3, bytes.zeros(64), 0,
+                                    bytes.zeros(16), 0).bit >= 0)
+
+    test.case("and the reverse tree, which is a distance's aligned low bits")
+    // A separate function rather than a flag, because using the wrong
+    // one produces plausible, wrong output rather than an error.
+    test.assert(xzrange.decode_tree_reverse(r, 4, bytes.zeros(64), 0,
+                                            bytes.zeros(16), 0).bit >= 0)
+
+    test.case("a well-formed stream leaves the coder with a zero code")
+    test.assert(not xzrange.is_clean(xzrange.start(bytes.zeros(0), 0)))
+
+@test
+fn test_lc_plus_lp_may_not_exceed_four_and_that_is_checked_first() [io]
+    // The literal model is 0x300 << (lc + lp) probabilities, so the
+    // ceiling is what makes the array sizeable at all.
+    test.case("0x5D is lc=3, lp=0, pb=2, which is what every xz writes")
+    match xzlzma.properties(0x5D)
+        Ok(p)  =>
+            test.assert(p.lc == xzlzma.XZ_LC_DEFAULT)
+            test.assert(p.lp == xzlzma.XZ_LP_DEFAULT)
+            test.assert(p.pb == xzlzma.XZ_PB_DEFAULT)
+        Err(_) => test.fail("0x5D is the default properties byte")
+
+    test.case("and it round-trips back to the same byte")
+    match xzlzma.properties_byte(3, 0, 2)
+        Ok(b)  => test.assert(b == 0x5D)
+        Err(_) => test.fail("3, 0, 2 is the default")
+
+    test.case("a byte above 224 is refused")
+    match xzlzma.properties(225)
+        Ok(_)  => test.fail("225 encodes no legal triple")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-lzma-properties")
+
+    test.case("and so is any triple whose lc + lp exceeds four")
+    test.assert(xzlzma.XZ_LCLP_MOST == 4)
+    match xzlzma.properties_byte(4, 1, 0)
+        Ok(_)  => test.fail("lc + lp of five has no model")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+@test
+fn test_the_probability_array_is_the_callers_and_this_says_how_big() [io]
+    test.case("the default model is 14,134 probabilities")
+    match xzlzma.properties(0x5D)
+        Ok(p)  => test.assert(xzlzma.probability_count(p) == 14134)
+        Err(_) => test.fail("0x5D is the default properties byte")
+
+    test.case("two bytes each, so 28 KiB and not 113 KiB of 64-bit words")
+    test.assert(xzlzma.probability_bytes(14134) == 28268)
+
+    test.case("a state reset sets every one of them to one half")
+    match xzlzma.reset_probabilities(bytes.zeros(64), 32)
+        Ok(b)  => test.assert(bytes.len(b) == 64)
+        Err(_) => test.fail("sixty-four bytes is room for thirty-two")
+
+    test.case("and an array too small is this program's sizing, not damage")
+    match xzlzma.reset_probabilities(bytes.zeros(8), 32)
+        Ok(_)  => test.fail("eight bytes is not room for thirty-two")
+        Err(f) => test.assert(xzerror.is_limit(f.kind))
+
+@test
+fn test_the_twelve_state_machine_and_the_four_rep_distances() [io]
+    test.case("there are twelve states, and below seven means the last was a literal")
+    test.assert(xzlzma.XZ_STATES == 12)
+    test.assert(xzlzma.state_is_literal(0))
+    test.assert(not xzlzma.state_is_literal(7))
+
+    test.case("each of the four transitions is its own function")
+    test.assert(xzlzma.next_state_literal(0) >= 0)
+    test.assert(xzlzma.next_state_match(0) >= 7)
+    test.assert(xzlzma.next_state_rep(0) >= 7)
+    test.assert(xzlzma.next_state_short_rep(0) >= 7)
+
+    test.case("a new distance goes to the front and the oldest falls off")
+    let reps = xzlzma.reps_push(xzlzma.reps_start(), 17)
+    test.assert(reps.r0 == 17)
+    test.assert(xzlzma.reps_at(reps, 0) == 17)
+
+    test.case("and naming one of the four moves it to the front")
+    test.assert(xzlzma.reps_use(reps, 0).r0 == 17)
+
+@test
+fn test_a_distance_is_a_slot_and_then_that_many_more_bits() [io]
+    test.case("the first four slots are the distance itself")
+    match xzlzma.slot_extra_bits(3)
+        Ok(n)  => test.assert(n == 0)
+        Err(_) => test.fail("3 is a slot")
+    match xzlzma.slot_base(3)
+        Ok(n)  => test.assert(n == 3)
+        Err(_) => test.fail("3 is a slot")
+
+    test.case("and there are sixty-four of them")
+    test.assert(xzlzma.XZ_DIST_SLOTS == 64)
+    match xzlzma.slot_extra_bits(64)
+        Ok(_)  => test.fail("64 is one past the last slot")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-parameter")
+
+    test.case("a match reaching past the output produced is THE safety check")
+    match xzlzma.check_distance(64, 16, 65536)
+        Ok(_)  => test.fail("a distance of 64 with 16 bytes produced")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "distance-too-far")
+
+    test.case("and one inside it is fine")
+    match xzlzma.check_distance(4, 16, 65536)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a distance of 4 with 16 bytes produced is fine")
+
+    test.case("matches run from 2 to 273 bytes")
+    test.assert(xzlzma.XZ_MATCH_LEN_LEAST == 2)
+    test.assert(xzlzma.XZ_MATCH_LEN_MOST == 273)
+
+@test
+fn test_the_legacy_lzma_container_has_no_magic_and_no_checksum() [io]
+    test.case("it is thirteen bytes and it is read, not written")
+    test.assert(xzlzma.XZ_LZMA_ALONE_HEADER_BYTES == 13)
+    match xzlzma.read_alone_header(bytes.zeros(13))
+        Ok(_)  => test.fail("a dictionary size of zero is refused")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+    test.case("a size field of all ones means the size is unknown")
+    test.assert(xzlzma.XZ_SIZE_UNKNOWN == -1)
+    test.assert(xzlzma.XZ_END_MARKER_DISTANCE == 0xFFFFFFFF)
+
+    test.case("which is why the bound matters more here than for .xz")
+    match xzlzma.decompress_alone(bytes.zeros(13), 1048576)
+        Ok(_)  => test.fail("thirteen zero bytes are not a .lzma file")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+    test.case("a header that parses answers whether its size is known")
+    match xzlzma.read_alone_header(bytes.zeros(13))
+        Ok(h)  => test.assert(not xzlzma.alone_size_known(h))
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+
+@test
+fn test_one_symbol_carries_its_fault_as_a_code_not_a_value() [io]
+    // A symbol loop that allocated a fault per symbol would allocate
+    // on the path that never fails.
+    test.case("a well-formed symbol has fault code zero")
+    test.assert(xzlzma.XZ_SYMBOL_FAULT_NONE == 0)
+
+    test.case("the three that are not are distance, range and buffer")
+    test.assert(xzlzma.XZ_SYMBOL_FAULT_DISTANCE == 1)
+    test.assert(xzlzma.XZ_SYMBOL_FAULT_RANGE == 2)
+    test.assert(xzlzma.XZ_SYMBOL_FAULT_BUFFER == 3)
+
+    test.case("and one symbol decode answers the coder, the state and the reps")
+    let s = xzlzma.decode_symbol(xzrange.start(bytes.zeros(5), 0), 0,
+                                 xzlzma.reps_start(), bytes.zeros(64),
+                                 bytes.zeros(16), 0, bytes.zeros(64), 0)
+    test.assert(s.produced >= 0)
+    test.assert(not s.ended)
+
+    test.case("the code turns into the fault the rest of the package speaks")
+    match xzlzma.symbol_fault(s, 0)
+        Some(f) => test.assert(xzerror.is_corrupt(f.kind))
+        None    => test.assert(true)
+
+@test
+fn test_lzma2_is_chunks_and_that_is_why_it_exists() [io]
+    test.case("0x00 ends the stream")
+    match xzlzma2.read_control(xzlzma2.XZ_LZMA2_END)
+        Ok(c)  => test.assert(c.is_end and c.header_bytes == 1)
+        Err(_) => test.fail("0x00 is the end marker")
+
+    test.case("0x01 and 0x02 are uncompressed chunks, which is how LZMA2 stores what LZMA would expand")
+    match xzlzma2.read_control(xzlzma2.XZ_LZMA2_UNCOMPRESSED_RESET)
+        Ok(c)  => test.assert(c.is_uncompressed)
+        Err(_) => test.fail("0x01 is an uncompressed chunk")
+    match xzlzma2.read_control(xzlzma2.XZ_LZMA2_UNCOMPRESSED_CONTINUE)
+        Ok(c)  => test.assert(c.is_uncompressed and not c.is_end)
+        Err(_) => test.fail("0x02 is an uncompressed chunk")
+
+    test.case("the gap between them and 0x80 is what a corrupt stream lands on")
+    match xzlzma2.read_control(0x03)
+        Ok(_)  => test.fail("0x03 is not a control byte")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-lzma2-chunk")
+
+    test.case("and the sizes are bounded by the format")
+    test.assert(xzlzma2.XZ_LZMA2_UNCOMPRESSED_MOST == 65536)
+    test.assert(xzlzma2.XZ_LZMA2_CHUNK_OUT_MOST == 2097152)
+    test.assert(xzlzma2.XZ_LZMA2_COMPRESSED_LEAST == 0x80)
+
+@test
+fn test_the_first_chunk_of_a_block_must_reset_the_dictionary() [io]
+    // Without that rule a block could reference the block before it,
+    // and `.xz`'s per-block independence would not hold.
+    test.case("there are four resets and only the last touches the dictionary")
+    test.assert(not xzlzma2.resets_dictionary(xzlzma2.XZ_LZMA2_RESET_NONE))
+    test.assert(not xzlzma2.resets_dictionary(xzlzma2.XZ_LZMA2_RESET_STATE))
+    test.assert(not xzlzma2.resets_dictionary(xzlzma2.XZ_LZMA2_RESET_PROPS))
+    test.assert(xzlzma2.resets_dictionary(xzlzma2.XZ_LZMA2_RESET_DICT))
+
+    test.case("the two upper resets carry a properties byte")
+    test.assert(not xzlzma2.carries_properties(xzlzma2.XZ_LZMA2_RESET_STATE))
+    test.assert(xzlzma2.carries_properties(xzlzma2.XZ_LZMA2_RESET_PROPS))
+    test.assert(xzlzma2.carries_properties(xzlzma2.XZ_LZMA2_RESET_DICT))
+
+    test.case("a control byte says which reset it performs")
+    match xzlzma2.reset_of(0xE0)
+        Ok(r)  => test.assert(r >= 0 and r <= 3)
+        Err(_) => test.fail("0xE0 is a compressed chunk")
+
+    test.case("both large buffers are the caller's")
+    match xzlzma2.decoder(bytes.zeros(4096), bytes.zeros(32768))
+        Ok(d)  =>
+            test.assert(xzlzma2.produced_of(d) == 0)
+            test.assert(xzlzma2.consumed_of(d) == 0)
+            match xzlzma2.properties_of(d)
+                Some(_) => test.fail("no chunk has carried properties yet")
+                None    => test.assert(true)
+            match xzlzma2.decode_chunk(d, bytes.zeros(8), 0)
+                Ok(_)  => test.fail("a zero control byte ends the stream, not a chunk")
+                Err(f) => test.assert(xzerror.is_corrupt(f.kind))
+        Err(_) => test.fail("4096 and 32768 are legal buffer sizes")
+
+    test.case("a chunk header encodes back to bytes")
+    match xzlzma2.read_chunk(bytes.zeros(6), 0)
+        Ok(c)  =>
+            match xzlzma2.chunk_header_bytes(c)
+                Ok(b)  => test.assert(bytes.len(b) >= 1)
+                Err(_) => test.fail("a chunk that read encodes")
+        Err(f) => test.assert(xzerror.is_corrupt(f.kind))
