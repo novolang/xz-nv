@@ -1,9 +1,6 @@
 // xzvli.nv — the variable-length integer every size field in an `.xz`
 // file is, and the four-byte padding rule that goes with it.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHAT A VLI IS.  Seven bits per byte, low bits first, with the top bit
 // set on every byte but the last: the same shape as a protobuf varint.
 // It is how a block header says how large its block is, how the index
@@ -77,7 +74,26 @@ struct XzVli
 //     println("${v.value} ${v.bytes} ${v.ok}")
 // ```
 pub fn decode(src: Bytes, off: Int) -> XzVli []
-    todo("xz-nv.xzvli.decode")
+    var value = 0
+    var shift = 0
+    var i = 0
+    while i < XZ_VLI_BYTES_MOST
+        match bytes.byte_at(src, off + i)
+            None    =>
+                return XzVli { value: 0, bytes: 0, ok: false }
+            Some(b) =>
+                value = value | ((b & 0x7F) << shift)
+                if (b & 0x80) == 0
+                    // The last byte.  A zero here carries no bits that
+                    // the byte before it did not already carry, so a
+                    // multi-byte encoding that ends in zero is one of
+                    // the spellings the format refuses.
+                    if i > 0 and b == 0
+                        return XzVli { value: 0, bytes: 0, ok: false }
+                    return XzVli { value: value, bytes: i + 1, ok: true }
+        shift = shift + 7
+        i = i + 1
+    XzVli { value: 0, bytes: 0, ok: false }
 
 // The fault a `decode` that answered `ok == false` should be reported
 // as, or `None`.
@@ -96,7 +112,10 @@ pub fn decode(src: Bytes, off: Int) -> XzVli []
 //         None    => println("read cleanly")
 // ```
 pub fn decode_fault(v: XzVli, off: Int) -> ?XzFault []
-    todo("xz-nv.xzvli.decode_fault")
+    if v.ok
+        None
+    else
+        Some(xzerror.fault(XzBadVli(off), xzerror.here(-1, off, xzerror.XZ_LAYER_STREAM)))
 
 // How many bytes the shortest encoding of `n` occupies, `1` ..= `9`.
 //
@@ -113,7 +132,15 @@ pub fn decode_fault(v: XzVli, off: Int) -> ?XzFault []
 //         Err(_) => println("not a value")
 // ```
 pub fn encoded_bytes(n: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzvli.encoded_bytes")
+    if n < 0
+        return Err(xzerror.fault(XzBadParameter("encoded_bytes: a negative value"),
+                                 xzerror.here(-1, -1, xzerror.XZ_LAYER_STREAM)))
+    var left = n
+    var count = 1
+    while left >= 128 and count < XZ_VLI_BYTES_MOST
+        left = left >>> 7
+        count = count + 1
+    Ok(count)
 
 // The bytes `n` encodes to, in the one form the format permits.
 //
@@ -127,7 +154,14 @@ pub fn encoded_bytes(n: Int) -> Result<Int, XzFault> []
 //         Err(f) => println(f.message())
 // ```
 pub fn encode(n: Int) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzvli.encode")
+    match encoded_bytes(n)
+        Err(f)    => Err(f)
+        Ok(count) =>
+            var dst = bytes.zeros(count)
+            match encode_into(n, var dst, 0)
+                // cov: skip — `encoded_bytes` sized the value before this writes it
+                Err(f) => Err(f)
+                Ok(_)  => Ok(dst)
 
 // Write `n` into a caller's buffer at `at`, and answer how many bytes
 // were written.
@@ -145,8 +179,21 @@ pub fn encode(n: Int) -> Result<Bytes, XzFault> []
 //         Ok(n)  => println("${n}")
 //         Err(f) => println(f.message())
 // ```
-pub fn encode_into(n: Int, dst: Bytes, at: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzvli.encode_into")
+pub fn encode_into(n: Int, var dst: Bytes, at: Int) -> Result<Int, XzFault> []
+    match encoded_bytes(n)
+        Err(f)    => Err(f)
+        Ok(count) =>
+            if bytes.len(dst) < at + count
+                return Err(xzerror.fault(XzBufferTooSmall(at + count, bytes.len(dst)),
+                                         xzerror.here(-1, at, xzerror.XZ_LAYER_STREAM)))
+            var left = n
+            for i in 0..count
+                var b = left & 0x7F
+                left = left >>> 7
+                if i < count - 1
+                    b = b | 0x80
+                dst = bytes.set_u8(dst, at + i, b)
+            Ok(count)
 
 // How many padding bytes follow `n` bytes of content: `0` ..= `3`.
 //
@@ -161,7 +208,7 @@ pub fn encode_into(n: Int, dst: Bytes, at: Int) -> Result<Int, XzFault> []
 //     println("${xzvli.padding_after(5)}")
 // ```
 pub fn padding_after(n: Int) -> Int []
-    todo("xz-nv.xzvli.padding_after")
+    (XZ_PADDING_ALIGN - n % XZ_PADDING_ALIGN) % XZ_PADDING_ALIGN
 
 // Whether `n` bytes of `src` from `off` are all zero.
 //
@@ -178,7 +225,14 @@ pub fn padding_after(n: Int) -> Int []
 //     println("${xzvli.padding_is_clean(bytes.zeros(3), 0, 3)}")
 // ```
 pub fn padding_is_clean(src: Bytes, off: Int, n: Int) -> Bool []
-    todo("xz-nv.xzvli.padding_is_clean")
+    for i in 0..n
+        // A byte past the end of the buffer reads as zero, the house
+        // rule for a range the caller has already bounded: the caller
+        // that could not spare the bytes is the caller that checks the
+        // length first.
+        if (bytes.byte_at(src, off + i) ?? 0) != 0
+            return false
+    true
 
 // `n` rounded up to the next multiple of four.
 //
@@ -189,4 +243,4 @@ pub fn padding_is_clean(src: Bytes, off: Int, n: Int) -> Bool []
 //     println("${xzvli.round_up(5)}")
 // ```
 pub fn round_up(n: Int) -> Int []
-    todo("xz-nv.xzvli.round_up")
+    n + padding_after(n)

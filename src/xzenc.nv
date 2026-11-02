@@ -1,20 +1,7 @@
-// xzenc.nv — the encoder, declared now and implemented later.
+// xzenc.nv — the encoder: settings, one greedy hash chain, LZMA2, and
+// the `.xz` container.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
-// WHY THE ENCODER IS DECLARED AND NOT BUILT.  The decoder has an
-// oracle: the xz format specification says what a stream means, and
-// the reference implementation's test files say whether this one
-// agrees, file by file.  An encoder has no such target.  Any stream
-// the reference decoder reads is a CORRECT stream; whether it is a
-// GOOD one is a question about ratio, and the reference answers it
-// with a binary-tree match finder, an optimal parser that costs every
-// candidate against the adaptive model's own current probabilities,
-// and a price table that is recomputed as the model moves.  That is
-// the release, not an afternoon.
-//
-// WHAT THIS ENCODER WILL AND WILL NOT DO, in the signatures rather
+// WHAT THIS ENCODER DOES AND DOES NOT DO, in the signatures rather
 // than in a footnote:
 //
 //   Threads          one.  Nothing here spawns anything, so the
@@ -34,11 +21,846 @@
 //
 // A CALLER ASKING FOR LEVEL 9 GETS A VALID `.xz` THAT IS MEASURABLY
 // LARGER THAN `xz -9`'s.  Saying so here is cheaper than letting
-// somebody discover it from a file size.
+// somebody discover it from a file size.  The gap is the release work
+// this package did not do: the reference answers it with a binary-tree
+// match finder, an optimal parser that costs every candidate against
+// the adaptive model's own current probabilities, and a price table
+// that is recomputed as the model moves.
 
 use xzerror
 use xzcheck
 use xzfilter
+use xzblock
+use xzindex
+use xzlzma
+use xzlzma2
+use xzrange
+use xzstream
+
+// One byte of a buffer, or zero past its end.
+//
+// The encoder reads ahead of the write point by design — a match is
+// the plaintext compared against itself — so every read is bounded by
+// a length check first and this is the shorthand for the reads that
+// are already bounded.
+fn byte_of(src: Bytes, k: Int) -> Int
+    bytes.byte_at(src, k) ?? 0
+
+// The probability at index `i` of a caller's array: two bytes, little
+// endian, eleven significant bits.
+//
+// The same convention `xzlzma`'s own private pair uses, restated here
+// because that pair is private: the two must agree or the encoder and
+// the decoder model different machines, and the round-trip test is
+// what holds them together.
+fn prob_at(probs: Bytes, i: Int) -> Int
+    if i < 0 or i * 2 + 1 >= bytes.len(probs)
+        // cov: skip — the encoder's own indexes are inside the array it allocated
+        return xzrange.XZ_PROB_INIT
+    byte_of(probs, i * 2) | (byte_of(probs, i * 2 + 1) << 8)
+
+// Write one back where it came from, if it came from inside the array.
+fn prob_put(var probs: Bytes, i: Int, v: Int)
+    if i < 0 or i * 2 + 1 >= bytes.len(probs)
+        // cov: skip — `prob_put` writes where `prob_at` read, both inside the array
+        return
+    bytes.set_u8(probs, i * 2, v & 0xFF)
+    bytes.set_u8(probs, i * 2 + 1, (v >>> 8) & 0xFF)
+
+// The coder's parameters: the same three numbers `xzlzma` publishes as
+// its defaults, written out rather than read from there because a
+// `const` may not name another module's `const` — the comptime
+// evaluator has no value to fold and the backend has nothing to emit.
+// `tests/zzenc_tests.nv` pins each of them to `xzlzma`'s, so a
+// divergence is a failing test rather than a file that decodes only in
+// this package.
+const XZ_LC = 3
+const XZ_LP = 0
+const XZ_PB = 2
+
+// How many probabilities the literal part holds at these parameters:
+// 6,144.
+const XZ_LIT = 0x300 << (XZ_LC + XZ_LP)
+
+// The properties byte for them: `(pb * 5 + lp) * 9 + lc`, and 0x5D for
+// the defaults, which is what every `xz` writes.
+const XZ_PROPS_BYTE = (XZ_PB * 5 + XZ_LP) * 9 + XZ_LC
+
+// How many position states the model's flags have room for: 16, the
+// largest `pb` of four allows.  Restated from `xzlzma`, whose copy is
+// private.
+const XZ_POS_STATES = 16
+
+// How many distance slots there are, and how many probabilities sit in
+// the two tables that follow the slot trees: the same layout numbers
+// `xzlzma` indexes with, for the same reason.
+const XZ_DIST_STATES = 4
+const XZ_DIST_SLOTS = 64
+
+// Where each model sits above the literal part, in the format's own
+// order: the flags, the distance tables, then the two length decoders.
+// The offsets are deltas from the literal part's end, which is what
+// makes them correct at every `lc` and `lp`.
+const XZ_IS_MATCH_AT = 0
+const XZ_IS_REP_AT = XZ_IS_MATCH_AT + XZ_STATES * XZ_POS_STATES
+const XZ_IS_REP0_AT = XZ_IS_REP_AT + XZ_STATES
+const XZ_IS_REP1_AT = XZ_IS_REP0_AT + XZ_STATES
+const XZ_IS_REP2_AT = XZ_IS_REP1_AT + XZ_STATES
+const XZ_IS_REP0_LONG_AT = XZ_IS_REP2_AT + XZ_STATES
+const XZ_DIST_SLOT_AT = XZ_IS_REP0_LONG_AT + XZ_STATES * XZ_POS_STATES
+const XZ_POS_SPECIAL_AT = XZ_DIST_SLOT_AT + XZ_DIST_STATES * XZ_DIST_SLOTS
+const XZ_POS_ALIGN_AT = XZ_POS_SPECIAL_AT + 114
+const XZ_MATCH_LEN_AT = XZ_POS_ALIGN_AT + 16
+const XZ_REP_LEN_AT = XZ_MATCH_LEN_AT + 2 + XZ_POS_STATES * 8 + XZ_POS_STATES * 8 + 256
+
+// How many states the machine has, restated for the offsets above and
+// pinned to `xzlzma`'s by the same test.
+const XZ_STATES = 12
+
+// The scratch buffer one LZMA2 chunk is coded into before its header is
+// written: the format's 65,536-byte ceiling for a compressed chunk plus
+// room for the coder's final flush.  A chunk stops 1,024 bytes below the
+// ceiling, so the flush and the last symbol always fit and a chunk never
+// has to be rewritten.
+const XZ_ENC_SCRATCH = 66560
+const XZ_ENC_CHUNK_LIMIT = 64512
+
+// The most positions the match finder remembers, and so the longest
+// distance it can ever code: 256 KiB.
+//
+// IT IS A CAP ON MEMORY, NOT ON THE FORMAT.  The chain is one `[Int]`
+// per remembered position and the hash table is one more, so a
+// four-megabyte window would be 32 MiB of tables for a 64 MiB
+// dictionary — a ratio the level-9 preset buys and this encoder does
+// not.  Every distance written is inside the window, and the window is
+// never larger than the dictionary the block header declares, so a
+// decoder's bound is still the one the header states.
+const XZ_ENC_WINDOW_MOST = 262144
+
+// How many entries the match finder's hash table has.
+const XZ_ENC_HASH_SIZE = 65536
+
+// The four remembered distances, named: the same order `reps_use`
+// takes.
+const XZ_REP_LONG_LEAST = 2
+
+// Whether a distance of this slot carries direct bits rather than a
+// modelled tree.  Slots at and above this one hold the align tree's
+// four bits.
+const XZ_SLOT_DIRECT_LEAST = 14
+
+// The range coder, forwards: the encoder's half of what `xzrange`
+// decodes with.
+//
+// A `@value` struct of six numbers, so the coder travels by return
+// value and no part of the encoder allocates to move one.  The output
+// is NOT in here: it is the caller's buffer, passed to every call that
+// can emit, because a `@value` field cannot hold a `Bytes` and because
+// one shared buffer per chunk is what a range coder wants anyway.
+//
+// `len` counts bytes emitted, including the ones the buffer had no room
+// for — `full` is the flag that says some were dropped, and it is
+// never set for the caller this encoder has, which always stops a chunk
+// a kilobyte below the ceiling.
+@value
+struct XzRangeEnc
+    // The low end of the interval, exactly as wide as the reference's
+    // 64-bit accumulator: the carry out of bit 31 is read, and the
+    // value is masked back to 32 bits on every shift.
+    low: Int
+    // How wide the interval still is.
+    range: Int
+    // The byte waiting to be emitted.  0xFF while a run of carries is
+    // being held.
+    cache: Int
+    // How many bytes the held cache stands for.
+    cache_size: Int
+    // Bytes emitted so far.
+    len: Int
+    // Whether the caller's buffer ran out.
+    full: Bool
+
+// A coder with an empty interval and nothing held.
+//
+// `cache_size` starts at one rather than zero, which is what makes the
+// first `shift_low` write the leading zero byte every range-coded
+// stream starts with — and what makes the decoder's "the first byte of
+// a range-coded stream was not zero" check a real one.
+fn range_start() -> XzRangeEnc
+    XzRangeEnc { low: 0, range: 0xFFFFFFFF, cache: 0, cache_size: 1,
+                 len: 0, full: false }
+
+// The coder with a new interval, and everything it was holding kept.
+fn renc_interval(r: XzRangeEnc, low: Int, range: Int) -> XzRangeEnc
+    XzRangeEnc { low: low, range: range, cache: r.cache,
+                 cache_size: r.cache_size, len: r.len, full: r.full }
+
+// Emit one byte, or hold it if a carry is still travelling.
+//
+// The reference's `rc_shift_low`, transcribed: while the low word has
+// no carry out of it, a held `0xFF` can be anything and stays held; the
+// moment the carry is known, every held byte is written as `cache +
+// carry` and the cache becomes the low word's top byte.
+//
+// The write is guarded rather than the caller being trusted: a chunk
+// that overflows its scratch buffer loses the bytes past the end and
+// says so with `full`, instead of writing over whatever follows.
+fn renc_shift(r: XzRangeEnc, var out: Bytes) -> XzRangeEnc
+    var cache = r.cache
+    var size = r.cache_size
+    var pos = r.len
+    var full = r.full
+    let low = r.low
+    if low < 0xFF000000 or (low >>> 32) != 0
+        let carry = low >>> 32
+        var k = 0
+        while k < size
+            if not full
+                if pos < bytes.len(out)
+                    bytes.set_u8(out, pos, (cache + carry) & 0xFF)
+                else
+                    // cov: skip — the scratch is 66560 bytes and the chunk limit is 64512, so the write always has room
+                    full = true
+            pos = pos + 1
+            cache = 0xFF
+            k = k + 1
+        cache = (low >>> 24) & 0xFF
+        size = 0
+    size = size + 1
+    XzRangeEnc { low: (low << 8) & 0xFFFFFFFF, range: r.range, cache: cache,
+                 cache_size: size, len: pos, full: full }
+
+// Bring the interval back above the normalisation threshold, emitting a
+// byte if it fell below it.
+//
+// ONE SHIFT IS ENOUGH, and it is the encoder's half of the same
+// argument `xzrange.normalized` makes for the decoder: the smallest
+// interval any bit can leave is a 2,048th of a 2^24-wide one, and one
+// eight-bit shift puts that back above 2^24.
+fn renc_norm(r: XzRangeEnc, var out: Bytes) -> XzRangeEnc
+    if r.range >= xzrange.XZ_RANGE_TOP
+        return r
+    renc_shift(renc_interval(r, r.low, (r.range << 8) & 0xFFFFFFFF), var out)
+
+// One modelled bit, against `probs[i]`, with the adapted probability
+// written back.
+//
+// The inverse of `xzrange.decode_bit`, and read beside it: the split is
+// the same `bound = (range >> 11) * prob`, bit 0 keeps `range = bound`
+// and bit 1 takes `range -= bound` with `low += bound`.  The adaptation
+// is `xzrange.adapt` itself rather than a second copy of it, because
+// the decoder and the encoder must move the model identically or they
+// are modelling two different machines.
+fn renc_bit(r: XzRangeEnc, var probs: Bytes, i: Int, bit: Int, var out: Bytes) -> XzRangeEnc
+    let prob = prob_at(probs, i)
+    let bound = (r.range >>> xzrange.XZ_PROB_BITS) * prob
+    prob_put(var probs, i, xzrange.adapt(prob, bit))
+    if bit == 0
+        renc_norm(renc_interval(r, r.low, bound), var out)
+    else
+        renc_norm(renc_interval(r, r.low + bound, r.range - bound), var out)
+
+// `n` direct bits, most significant first, with no probability model:
+// the inverse of `xzrange.decode_direct`, which splits the interval in
+// half and reads one bit out of the comparison.
+fn renc_direct(r: XzRangeEnc, value: Int, n: Int, var out: Bytes) -> XzRangeEnc
+    var cur = r
+    var k = n
+    while k > 0
+        k = k - 1
+        let half = cur.range >>> 1
+        if ((value >>> k) & 1) != 0
+            cur = renc_interval(cur, cur.low + half, half)
+        else
+            cur = renc_interval(cur, cur.low, half)
+        cur = renc_norm(cur, var out)
+    cur
+
+// A bit tree of `n` levels, most significant bit first: the encoder's
+// half of `xzrange.decode_tree`, walking `m = 2m + bit` from the root
+// and writing the value into the tree's own probabilities as it goes.
+fn renc_tree(r: XzRangeEnc, var probs: Bytes, at: Int, n: Int, value: Int,
+             var out: Bytes) -> XzRangeEnc
+    var coder = r
+    var m = 1
+    var k = n - 1
+    while k >= 0
+        let b = (value >>> k) & 1
+        coder = renc_bit(coder, var probs, at + m, b, var out)
+        m = m * 2 + b
+        k = k - 1
+    coder
+
+// The same tree, least significant bit first: LZMA's two distance
+// tables, where the value's high bit is the first one coded and its low
+// bit is the last.
+fn renc_tree_rev(r: XzRangeEnc, var probs: Bytes, at: Int, n: Int, value: Int,
+                 var out: Bytes) -> XzRangeEnc
+    var coder = r
+    var m = 1
+    var k = 0
+    while k < n
+        let b = (value >>> k) & 1
+        coder = renc_bit(coder, var probs, at + m, b, var out)
+        m = m * 2 + b
+        k = k + 1
+    coder
+
+// Put the coder to rest: five `shift_low`s, which is what it takes to
+// push the last of the interval out of the cache and past the carries.
+//
+// THE FIVE IS THE FORMAT'S, not a guess: the decoder reads one byte
+// more than the symbols need (`xzrange.normalize`, "in rare cases there
+// is a useless byte that needs to be read anyway") and then requires the
+// coder to be clean and to have consumed exactly the chunk's payload.
+fn renc_flush(r: XzRangeEnc, var out: Bytes) -> XzRangeEnc
+    var coder = r
+    var i = 0
+    while i < 5
+        coder = renc_shift(coder, var out)
+        i = i + 1
+    coder
+
+// A match length: two choice bits, then the three-bit tree for lengths
+// two to nine, the second one for ten to seventeen, or the eight-bit one
+// for everything above.  The inverse of `xzlzma`'s `length_at`.
+fn enc_len(r: XzRangeEnc, var probs: Bytes, base: Int, pos: Int, len: Int,
+           var out: Bytes) -> XzRangeEnc
+    let v = len - xzlzma.XZ_MATCH_LEN_LEAST
+    var coder = r
+    if v < 8
+        coder = renc_bit(coder, var probs, base, 0, var out)
+        coder = renc_tree(coder, var probs, base + 2 + pos * 8, 3, v, var out)
+    else
+        coder = renc_bit(coder, var probs, base, 1, var out)
+        if v < 16
+            coder = renc_bit(coder, var probs, base + 1, 0, var out)
+            coder = renc_tree(coder, var probs, base + 130 + pos * 8, 3, v - 8, var out)
+        else
+            coder = renc_bit(coder, var probs, base + 1, 1, var out)
+            coder = renc_tree(coder, var probs, base + 258, 8, v - 16, var out)
+    coder
+
+// How many bits the value below a distance needs before its slot can be
+// named: the integer log base two, and zero for zero.
+fn log2_floor(v: Int) -> Int
+    var n = 0
+    var x = v
+    while x > 1
+        x = x >>> 1
+        n = n + 1
+    n
+
+// The slot a coded distance is written as.
+//
+// The first four distances are their own slot.  Above that the slot
+// says how many bits the distance has and which half of that size it
+// is in, and the inverse — `xzlzma`'s `distance_of` — is what the two
+// must agree on: for a slot `s` at or above four, `footer = (s >> 1) -
+// 1` and `base = (2 | (s & 1)) << footer` is the smallest distance the
+// slot can hold.
+fn slot_of(coded: Int) -> Int
+    if coded < 4
+        return coded
+    let n = log2_floor(coded)
+    n * 2 + ((coded >>> (n - 1)) & 1)
+
+// A distance: its slot tree, then whatever the slot leaves over —
+// a modelled tree for the near slots, direct bits and the aligned tree
+// for the far ones.
+//
+// `lit + XZ_POS_SPECIAL_AT + base - slot - 1` IS NOT A TYPO: the
+// special-distance tables are laid out with one tree per slot from
+// fourteen downwards, so the slot's own offset counts backwards from
+// the base it holds.
+fn enc_distance(r: XzRangeEnc, var probs: Bytes, lit: Int, len: Int, coded: Int,
+                var out: Bytes) -> XzRangeEnc
+    let slot = slot_of(coded)
+    var coder = renc_tree(r, var probs, lit + XZ_DIST_SLOT_AT
+                          + dist_state_for(len) * XZ_DIST_SLOTS,
+                          6, slot, var out)
+    if slot < 4
+        return coder
+    let footer = (slot >>> 1) - 1
+    let base = (2 | (slot & 1)) << footer
+    let rest = coded - base
+    if slot < XZ_SLOT_DIRECT_LEAST
+        renc_tree_rev(coder, var probs, lit + XZ_POS_SPECIAL_AT + base - slot - 1,
+                      footer, rest, var out)
+    else
+        coder = renc_direct(coder, rest >>> 4, footer - 4, var out)
+        renc_tree_rev(coder, var probs, lit + XZ_POS_ALIGN_AT, 4, rest & 0xF, var out)
+
+// Which of the four length tables a match of this length uses.
+fn dist_state_for(len: Int) -> Int
+    if len < 6
+        len - xzlzma.XZ_MATCH_LEN_LEAST
+    else
+        XZ_DIST_STATES - 1
+
+// One byte through an eight-bit literal tree, and the context that
+// chose the tree.
+//
+// Two trees, not one: a literal that follows a match is coded against
+// the byte the current distance points at, one bit of that byte at a
+// time, while the two agree.  `offs` is the walk's cursor and it goes
+// to zero the moment they disagree, which is exactly what the decoder
+// computes from the same two numbers.
+fn enc_literal(r: XzRangeEnc, var probs: Bytes, pos: Int, prev: Int, byte: Int, st: Int,
+               match_byte: Int, var out: Bytes) -> XzRangeEnc
+    let base = (((pos & ((1 << XZ_LP) - 1)) << XZ_LC) + (prev >>> (8 - XZ_LC))) * 0x300
+    var coder = r
+    var symbol = 1
+    var k = 0
+    if xzlzma.state_is_literal(st)
+        while k < 8
+            let b = (byte >>> (7 - k)) & 1
+            coder = renc_bit(coder, var probs, base + symbol, b, var out)
+            symbol = symbol * 2 + b
+            k = k + 1
+    else
+        var against = match_byte << 1
+        var offs = 0x100
+        while k < 8
+            let mb = against & offs
+            let b = (byte >>> (7 - k)) & 1
+            coder = renc_bit(coder, var probs, base + offs + mb + symbol, b, var out)
+            if b == 0
+                offs = offs & ~mb
+            else
+                offs = offs & mb
+            symbol = symbol * 2 + b
+            against = against << 1
+            k = k + 1
+    coder
+
+// Which positions the match finder remembers: 1,024 entries up to the
+// dictionary the filter names, and never past the cap.
+fn window_for(dict_bytes: Int) -> Int
+    var w = 1024
+    while w * 2 <= dict_bytes and w * 2 <= XZ_ENC_WINDOW_MOST
+        w = w * 2
+    w
+
+// The three bytes at a position folded into a hash table index.
+fn enc_hash(content: Bytes, pos: Int) -> Int
+    let a = byte_of(content, pos)
+    let b = byte_of(content, pos + 1)
+    let c = byte_of(content, pos + 2)
+    ((a << 8) ^ (b << 4) ^ c) & (XZ_ENC_HASH_SIZE - 1)
+
+// Put a position at the head of its hash chain.
+//
+// The chain is a ring: `prev` holds one entry per remembered position
+// and the slot for a position is its own index modulo the window, so a
+// link older than the window is simply overwritten and the walk below
+// stops before it can follow one.
+fn chain_insert(var head: [Int], var prev: [Int], w: Int, h: Int, pos: Int)
+    prev[pos & (w - 1)] = head[h]
+    head[h] = pos + 1
+
+// How many bytes agree from `a` and from `b`, `b` behind the write
+// point, at most `most`.
+//
+// Overlap is allowed and is the normal case: a run of one byte is a
+// distance of one and a length of a thousand, and the decoder's copy
+// reproduces it because it writes forwards.  What this has to check is
+// the plaintext's own equality, which is what makes the decoder's copy
+// come out the same.
+fn match_len(content: Bytes, a: Int, b: Int, most: Int) -> Int
+    var n = 0
+    while n < most and b + n < bytes.len(content)
+        if byte_of(content, a + n) != byte_of(content, b + n)
+            return n
+        n = n + 1
+    n
+
+// The longest match a new distance can name at `pos`, and that
+// distance as the format codes it.
+//
+// A greedy walk down one hash chain, bounded by the preset's depth and
+// cut short by its `nice` length.  The answer is `(0, 0)` when the
+// chain holds nothing.
+fn best_match(content: Bytes, head: [Int], prev: [Int], w: Int, pos: Int, depth: Int,
+              nice: Int) -> (Int, Int)
+    if pos + 3 > bytes.len(content)
+        return (0, 0)
+    let oldest = pos - w + 1
+    var c = head[enc_hash(content, pos)]
+    var best = 0
+    var best_src = 0
+    var tried = 0
+    var going = true
+    while going and tried < depth
+        let at = c - 1
+        if c == 0 or at < oldest
+            going = false
+        else
+            if at < pos
+                let n = match_len(content, at, pos, xzlzma.XZ_MATCH_LEN_MOST)
+                if n > best
+                    best = n
+                    best_src = at
+            tried = tried + 1
+            if best >= nice
+                going = false
+            else
+                c = prev[at & (w - 1)]
+    if best == 0
+        return (0, 0)
+    (best, pos - best_src - 1)
+
+// The longest of the four remembered distances at `pos`, which index it
+// is, and the distance as the format codes it.
+//
+// `(0, -1, 0)` when none of them matches.  The four are tried in
+// order so a tie goes to the one that costs the fewest bits to name.
+fn best_rep(content: Bytes, reps: XzRepDistances, pos: Int) -> (Int, Int, Int)
+    var best = 0
+    var which = -1
+    var best_coded = 0
+    var k = 0
+    while k < 4
+        let coded = xzlzma.reps_at(reps, k)
+        let src = pos - coded - 1
+        if coded >= 0 and src >= 0
+            let n = match_len(content, src, pos, xzlzma.XZ_MATCH_LEN_MOST)
+            if n > best
+                best = n
+                which = k
+                best_coded = coded
+        k = k + 1
+    (best, which, best_coded)
+
+// One symbol of a block, encoded, with the machine it left behind.
+//
+// A `@value` struct for the same reason `xzlzma`'s symbol is one: a
+// megabyte of content is a million of these and none of them may
+// allocate.
+@value
+struct XzEncStep
+    // The coder after the symbol.
+    coder: XzRangeEnc
+    // The state after it.
+    state: Int
+    // The remembered distances after it.
+    reps: XzRepDistances
+    // Where the write point is after it.
+    pos: Int
+
+// Encode one symbol at `pos`, choosing it first.
+//
+// THE CHOICE IS GREEDY AND THAT IS THE WHOLE OF IT: a rep match is
+// taken when it is within two bytes of the best new match, a new match
+// when it is at least three bytes long, a one-byte rep when the last
+// distance can name it, and a literal otherwise.  The reference spends
+// a price table on this decision and gets a few percent; the two lines
+// below are what the module comment means by "not an optimal parser".
+//
+// Every position the symbol covers is inserted into the chain, not
+// just the one it was chosen at: the positions a match skips over are
+// exactly the ones the next match wants to name.
+fn enc_symbol(content: Bytes, var probs: Bytes, coder: XzRangeEnc, st: Int, reps: XzRepDistances,
+              pos: Int, depth: Int, nice: Int, var head: [Int], var prev: [Int], w: Int,
+              var out: Bytes) -> XzEncStep
+    let lit = XZ_LIT
+    let pos_state = pos & ((1 << XZ_PB) - 1)
+    let is_match = lit + XZ_IS_MATCH_AT + st * XZ_POS_STATES + pos_state
+    let (rep_len, which, rep_coded) = best_rep(content, reps, pos)
+    let (new_len, new_coded) = best_match(content, head, prev, w, pos, depth, nice)
+    var kind = 0
+    // A literal and a short rep each cover one byte; the two match
+    // kinds overwrite this with the length they found.
+    var len = 1
+    var coded = 0
+    if rep_len >= XZ_REP_LONG_LEAST and new_len < rep_len + 3
+        kind = 2
+        len = rep_len
+        coded = rep_coded
+    else if new_len >= 3
+        kind = 1
+        len = new_len
+        coded = new_coded
+    else if rep_len >= 1 and which == 0
+        kind = 3
+        len = 1
+        coded = rep_coded
+    var cur = coder
+    var state = st
+    var distances = reps
+    if kind == 0
+        cur = renc_bit(cur, var probs, is_match, 0, var out)
+        if pos == 0
+            cur = enc_literal(cur, var probs, pos, 0, byte_of(content, pos), state, 0, var out)
+        else
+            cur = enc_literal(cur, var probs, pos, byte_of(content, pos - 1),
+                              byte_of(content, pos), state,
+                              byte_of(content, pos - xzlzma.reps_at(reps, 0) - 1), var out)
+        state = xzlzma.next_state_literal(state)
+    else
+        if kind == 1
+            cur = renc_bit(cur, var probs, is_match, 1, var out)
+            cur = renc_bit(cur, var probs, lit + XZ_IS_REP_AT + state, 0, var out)
+            cur = enc_len(cur, var probs, lit + XZ_MATCH_LEN_AT, pos_state, len, var out)
+            cur = enc_distance(cur, var probs, lit, len, coded, var out)
+            distances = xzlzma.reps_push(distances, coded)
+            state = xzlzma.next_state_match(state)
+        else
+            cur = renc_bit(cur, var probs, is_match, 1, var out)
+            cur = renc_bit(cur, var probs, lit + XZ_IS_REP_AT + state, 1, var out)
+            if which == 0
+                cur = renc_bit(cur, var probs, lit + XZ_IS_REP0_AT + state, 0, var out)
+                if kind == 3
+                    cur = renc_bit(cur, var probs, lit + XZ_IS_REP0_LONG_AT
+                                   + state * XZ_POS_STATES + pos_state,
+                                   0, var out)
+                    state = xzlzma.next_state_short_rep(state)
+                else
+                    cur = renc_bit(cur, var probs, lit + XZ_IS_REP0_LONG_AT
+                                   + state * XZ_POS_STATES + pos_state,
+                                   1, var out)
+                    cur = enc_len(cur, var probs, lit + XZ_REP_LEN_AT, pos_state, len, var out)
+                    state = xzlzma.next_state_rep(state)
+            else
+                cur = renc_bit(cur, var probs, lit + XZ_IS_REP0_AT + state, 1, var out)
+                if which == 1
+                    cur = renc_bit(cur, var probs, lit + XZ_IS_REP1_AT + state, 0, var out)
+                else
+                    cur = renc_bit(cur, var probs, lit + XZ_IS_REP1_AT + state, 1, var out)
+                    if which == 2
+                        cur = renc_bit(cur, var probs, lit + XZ_IS_REP2_AT + state, 0, var out)
+                    else
+                        cur = renc_bit(cur, var probs, lit + XZ_IS_REP2_AT + state, 1, var out)
+                cur = enc_len(cur, var probs, lit + XZ_REP_LEN_AT, pos_state, len, var out)
+                state = xzlzma.next_state_rep(state)
+            distances = xzlzma.reps_use(distances, which)
+    // One entry per position the symbol covered, so the next search can
+    // find every one of them.
+    var k = 0
+    while k < len
+        if pos + k + 3 <= bytes.len(content)
+            chain_insert(var head, var prev, w, enc_hash(content, pos + k), pos + k)
+        k = k + 1
+    XzEncStep { coder: cur, state: state, reps: distances, pos: pos + len }
+
+// One LZMA2 chunk header, from the numbers it carries.
+//
+// The reset code is the whole of the difference between the first chunk
+// of a block and the rest: the first must reset the dictionary, which
+// also means carrying the properties byte, and every later chunk
+// continues the model the one before it left.
+fn chunk_header(reset: Int, uncompressed: Int, compressed: Int,
+                props_byte: ?Int) -> Result<Bytes, XzFault> []
+    var header_bytes = 5
+    if xzlzma2.carries_properties(reset)
+        header_bytes = 6
+    xzlzma2.chunk_header_bytes(XzLzma2Chunk {
+        is_end: false,
+        is_uncompressed: false,
+        reset: reset,
+        uncompressed_size: uncompressed,
+        compressed_size: compressed,
+        header_bytes: header_bytes,
+        props_byte: props_byte })
+
+// The LZMA2 data field of one block: its chunks, then the end marker.
+//
+// THE MODEL IS THE BLOCK'S.  A dictionary reset restarts the state
+// machine, the four distances and every probability, so the model is
+// created here and lives until this function returns; the chunk loop
+// carries it from one chunk to the next, which is what makes a chunk
+// after the first cost five header bytes rather than a new model.
+//
+// The chunk loop is bounded by the format twice over: a compressed
+// chunk holds at most 65,536 bytes, which the scratch buffer enforces,
+// and produces at most two megabytes, which the content position
+// enforces.
+fn lzma2_of_block(dict_bytes: Int, depth: Int, nice: Int,
+                  content: Bytes) -> Result<Bytes, XzFault> []
+    let n = bytes.len(content)
+    let model = match xzlzma.properties(XZ_PROPS_BYTE)
+        Err(f) =>
+            // cov: skip — the module's own properties byte always has properties
+            return Err(f)
+        Ok(p)  => p
+    let count = xzlzma.probability_count(model)
+    let w = window_for(dict_bytes)
+    var probs = bytes.zeros(xzlzma.probability_bytes(count))
+    // The reset writes into the array it is given, so the answer is
+    // the same buffer and there is nothing to rebind: every entry is
+    // the initial probability before the first symbol is coded.
+    match xzlzma.reset_probabilities(var probs, count)
+        Err(f) =>
+            // cov: skip — the count is the array's own size, which `reset_probabilities` accepts
+            return Err(f)
+        Ok(_)  => ()
+    var head = list.zeros(XZ_ENC_HASH_SIZE)
+    var prev = list.zeros(w)
+    var state = 0
+    var reps = xzlzma.reps_start()
+    var pos = 0
+    var first = true
+    var out = bytes.zeros(0)
+    while pos < n
+        let chunk_from = pos
+        // The scratch buffer is per chunk and the coder starts empty
+        // for each one: an LZMA2 chunk's payload is a range-coded
+        // stream of its own, and only the model crosses the boundary.
+        var scratch = bytes.zeros(XZ_ENC_SCRATCH)
+        var coder = range_start()
+        var cpos = pos
+        var cstate = state
+        var creps = reps
+        var cprobs = bytes.clone(probs)
+        var going = true
+        while going and cpos < n
+            if coder.len >= XZ_ENC_CHUNK_LIMIT
+                going = false
+            else
+                // The bound is checked before the symbol rather than
+                // after it, so it leaves room for the longest symbol
+                // there is: stopping AT two megabytes would let the
+                // last match carry the chunk past the ceiling.
+                if cpos - chunk_from + xzlzma.XZ_MATCH_LEN_MOST > xzlzma2.XZ_LZMA2_CHUNK_OUT_MOST
+                    going = false
+                else
+                    let step = enc_symbol(content, var cprobs, coder, cstate, creps, cpos,
+                                          depth, nice, var head, var prev, w, var scratch)
+                    coder = step.coder
+                    cstate = step.state
+                    creps = step.reps
+                    cpos = step.pos
+        coder = renc_flush(coder, var scratch)
+        if coder.len <= 0 or cpos <= chunk_from
+            // A chunk with no bytes or no content has no header the
+            // format allows, and the loop above always encodes at
+            // least one symbol before it looks at either bound.
+            // cov: skip — the loop encodes a symbol before either bound and a flush always writes five bytes
+            return Err(bad_parameter("xzenc: a chunk that encoded nothing"))
+        var reset = xzlzma2.XZ_LZMA2_RESET_NONE
+        var byte: ?Int = None
+        if first
+            reset = xzlzma2.XZ_LZMA2_RESET_DICT
+            byte = Some(XZ_PROPS_BYTE)
+        match chunk_header(reset, cpos - chunk_from, coder.len, byte)
+            Err(f)     =>
+                // cov: skip — the two loop bounds keep both sizes inside the header's fields
+                return Err(f)
+            Ok(header) =>
+                out = out + header + bytes.slice(scratch, 0, coder.len)
+        pos = cpos
+        state = cstate
+        reps = creps
+        probs = cprobs
+        first = false
+    var end = bytes.zeros(1)
+    bytes.set_u8(end, 0, xzlzma2.XZ_LZMA2_END)
+    Ok(out + end)
+
+// One finished block: its header, its data, its padding and its check,
+// with the two numbers the index records.
+//
+// A plain struct rather than a `@value` one, because it holds a
+// `Bytes`.
+struct XzEncBlock
+    // Everything from the header's size byte to the last check byte.
+    bytes: Bytes
+    // Header plus data plus check, WITHOUT the padding.
+    unpadded: Int
+    // How many content bytes the block holds.
+    uncompressed: Int
+
+// A fault naming a parameter of the encoder's own.
+//
+// The stream layer, because an encoder's settings are a caller's
+// mistake about a stream rather than about a block: there is no block
+// yet to name.
+fn bad_parameter(what: Str) -> XzFault
+    xzerror.fault(XzBadParameter(what), xzerror.here(-1, -1, xzerror.XZ_LAYER_STREAM))
+
+// Compress one block: the converters, then LZMA2, then the container
+// around both.
+//
+// THE CHECK IS OVER THE CONTENT AS IT WILL COME BACK, not over what
+// LZMA2 was handed: a delta or branch filter's whole point is that its
+// output differs, and a decoder's check runs after it has undone them.
+fn build_block(s: XzSettings, content: Bytes) -> Result<XzEncBlock, XzFault> []
+    let last = list.len(s.filters) - 1
+    var work = bytes.clone(content)
+    var i = 0
+    while i < last
+        match xzfilter.encode_in_place(s.filters[i], var work, 0, bytes.len(work))
+            Err(f) =>
+                // cov: skip — the chain was checked when the settings were made
+                return Err(f)
+            Ok(b)  =>
+                work = bytes.clone(b)
+        i = i + 1
+    let filter = s.filters[last]
+    let dict_byte = bytes.byte_at(filter.props, 0) ?? 0
+    let dict_bytes = match xzfilter.lzma2_dictionary_bytes(dict_byte)
+        Err(f) =>
+            // cov: skip — the dictionary byte came out of that checked chain
+            return Err(f)
+        Ok(n)  => n
+    let depth = chain_depth_for(s.preset)
+    let nice = nice_len_for(s.preset)
+    let data = match lzma2_of_block(dict_bytes, depth, nice, work)
+        Err(f) =>
+            // cov: skip — `lzma2_of_block` refuses only what the loop bounds prevent
+            return Err(f)
+        Ok(b)  => b
+    let header = match xzblock.header_bytes(
+        xzblock.header(s.filters, bytes.len(data), bytes.len(content)))
+        Err(f) =>
+            // cov: skip — the header is sized from the bytes `lzma2_of_block` produced
+            return Err(f)
+        Ok(b)  => b
+    let started = match xzcheck.start(s.check)
+        Err(f) =>
+            return Err(f)
+        Ok(c)  => c
+    var check = bytes.zeros(0)
+    match xzcheck.size_of(s.check)
+        Err(f) =>
+            // cov: skip — `start(check)` accepted this check above, and every check it accepts has a size
+            return Err(f)
+        Ok(_)  =>
+            check = xzcheck.finish(xzcheck.update(started, content, 0, bytes.len(content)))
+    let unpadded = match xzblock.unpadded_size(bytes.len(header), bytes.len(data),
+                                               bytes.len(check))
+        Err(f) =>
+            // cov: skip — `unpadded_size` refuses only negative lengths
+            return Err(f)
+        Ok(n)  => n
+    let pad = xzblock.padding_after(unpadded)
+    Ok(XzEncBlock {
+        bytes: header + data + bytes.zeros(pad) + check,
+        unpadded: unpadded,
+        uncompressed: bytes.len(content) })
+
+// The stream header, once: the twelve bytes nothing else can be read
+// without, and an empty answer after the first block has carried them.
+fn stream_head(s: XzSettings, started: Bool) -> Result<Bytes, XzFault> []
+    if started
+        return Ok(bytes.zeros(0))
+    match xzstream.flags(s.check)
+        // cov: skip — `flags` accepts every check `is_supported` accepted
+        Err(f) => Err(f)
+        Ok(fl) => Ok(xzstream.header_bytes(fl))
+
+// How deep the match finder walks one hash chain at a preset, and the
+// length at which it stops walking.
+//
+// What a preset actually changes, besides the dictionary size: nine
+// levels of how hard the encoder looks, from four candidates at level
+// zero to forty at level nine.
+fn chain_depth_for(preset: Int) -> Int
+    8 + preset * 4
+
+// The length at which a longer match is not worth finding.
+fn nice_len_for(preset: Int) -> Int
+    24 + preset * 4
 
 // The lowest preset: 0.
 pub const XZ_PRESET_LEAST = 0
@@ -93,7 +915,23 @@ pub struct XzSettings
 //         Err(e) => println(e.message())
 // ```
 pub fn settings(preset: Int) -> Result<XzSettings, XzFault> []
-    todo("xz-nv.xzenc.settings")
+    if preset < XZ_PRESET_LEAST or preset > XZ_PRESET_MOST
+        return Err(bad_parameter("settings: a preset outside 0 to 9"))
+    let dict = match dictionary_bytes_for(preset)
+        Err(f) =>
+            // cov: skip — the preset was range-checked at the top of `settings`
+            return Err(f)
+        Ok(n)  => n
+    let byte = match xzfilter.lzma2_dictionary_byte_for(dict)
+        Err(f) =>
+            // cov: skip — the dictionary came from the preset's own table
+            return Err(f)
+        Ok(b)  => b
+    match xzfilter.lzma2(byte)
+        // cov: skip — the dictionary came out of the preset's own table
+        Err(f) => Err(f)
+        Ok(f0) => Ok(XzSettings { preset: preset, filters: [f0],
+                                  check: xzcheck.XZ_CHECK_CRC64, block_bytes: -1 })
 
 // The same settings with a different check type.
 //
@@ -107,7 +945,8 @@ pub fn settings(preset: Int) -> Result<XzSettings, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn with_check(s: XzSettings, check: Int) -> XzSettings []
-    todo("xz-nv.xzenc.with_check")
+    XzSettings { preset: s.preset, filters: s.filters, check: check,
+                 block_bytes: s.block_bytes }
 
 // The same settings with a filter chain of the caller's.
 //
@@ -128,7 +967,10 @@ pub fn with_check(s: XzSettings, check: Int) -> XzSettings []
 //         Err(e) => println(e.message())
 // ```
 pub fn with_filters(s: XzSettings, filters: [XzFilter]) -> Result<XzSettings, XzFault> []
-    todo("xz-nv.xzenc.with_filters")
+    match xzfilter.check_chain(filters)
+        Err(f) => Err(f)
+        Ok(_)  => Ok(XzSettings { preset: s.preset, filters: filters, check: s.check,
+                                 block_bytes: s.block_bytes })
 
 // The same settings with a block size, which is what makes the output
 // seekable.
@@ -148,7 +990,13 @@ pub fn with_filters(s: XzSettings, filters: [XzFilter]) -> Result<XzSettings, Xz
 //         Err(e) => println(e.message())
 // ```
 pub fn with_block_bytes(s: XzSettings, n: Int) -> Result<XzSettings, XzFault> []
-    todo("xz-nv.xzenc.with_block_bytes")
+    // The floor is not arbitrary: a block header is up to 1,024 bytes
+    // and a check is up to 32, so a block smaller than a page of
+    // content is mostly container.
+    if n != -1 and n < 4096
+        return Err(bad_parameter("with_block_bytes: a size that is neither -1 nor at least 4096"))
+    Ok(XzSettings { preset: s.preset, filters: s.filters, check: s.check,
+                    block_bytes: n })
 
 // The dictionary size a preset asks for, in bytes.
 //
@@ -165,7 +1013,22 @@ pub fn with_block_bytes(s: XzSettings, n: Int) -> Result<XzSettings, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn dictionary_bytes_for(preset: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzenc.dictionary_bytes_for")
+    // `xz`'s own nine rows, including the two repeats — levels 3 and 4
+    // both ask for 4 MiB and levels 5 and 6 both for 8 MiB, because
+    // what separates them is how hard the encoder looks rather than how
+    // far back it can.
+    match preset
+        0 => Ok(262144)
+        1 => Ok(1048576)
+        2 => Ok(2097152)
+        3 => Ok(4194304)
+        4 => Ok(4194304)
+        5 => Ok(8388608)
+        6 => Ok(8388608)
+        7 => Ok(16777216)
+        8 => Ok(33554432)
+        9 => Ok(67108864)
+        _ => Err(bad_parameter("dictionary_bytes_for: a preset outside 0 to 9"))
 
 // An encoder between pushes.
 //
@@ -188,6 +1051,14 @@ pub struct XzEncoder
     blocks: Int
     // Whether the stream header has been written.
     started: Bool
+    // Content taken but not yet part of a finished block.  It is here
+    // and not in the caller because a block's check is over its whole
+    // content and its header declares its whole size, so a block
+    // cannot be written a piece at a time.
+    pending: Bytes
+    // One record per block already written, which the index is built
+    // from when the stream closes.
+    records: [XzIndexRecord]
 
 // An encoder for a set of settings.
 //
@@ -200,13 +1071,19 @@ pub struct XzEncoder
 //         Err(e) => println(e.message())
 // ```
 pub fn encoder(s: XzSettings) -> XzEncoder []
-    todo("xz-nv.xzenc.encoder")
+    XzEncoder { settings: s, taken: 0, written: 0, blocks: 0, started: false,
+                pending: bytes.zeros(0), records: [] }
 
 // Give the encoder more content, and take whatever compressed bytes it
 // completed.
 //
 // The mirror of `xzdec.feed`: nothing comes back until a block fills,
 // and then a whole block at once.
+//
+// A SETTING THAT CANNOT BE COMPRESSED IS REPORTED BY `close` AND NOT
+// HERE.  This function has no `Result` to put a fault in — the
+// released signature is a pair — so a block that fails to build stays
+// pending and the fault surfaces where a caller can see it.
 //
 // ```novo
 // use std.bytes
@@ -220,9 +1097,56 @@ pub fn encoder(s: XzSettings) -> XzEncoder []
 //         Err(e) => println(e.message())
 // ```
 pub fn push(e: XzEncoder, chunk: Bytes) -> (XzEncoder, Bytes) []
-    todo("xz-nv.xzenc.push")
+    let took = e.taken + bytes.len(chunk)
+    var rest = e.pending + chunk
+    if e.settings.block_bytes <= 0
+        // One block covering everything: there is nothing to emit
+        // until `close`, because a block's header declares its size.
+        (XzEncoder { settings: e.settings, taken: took, written: e.written,
+                     blocks: e.blocks, started: e.started, pending: rest,
+                     records: list.clone(e.records) },
+                     bytes.zeros(0))
+    else
+        var out = bytes.zeros(0)
+        var started = e.started
+        var blocks = e.blocks
+        var written = e.written
+        var records = list.clone(e.records)
+        var going = true
+        while going
+            if bytes.len(rest) < e.settings.block_bytes
+                going = false
+            else
+                match build_block(e.settings, bytes.slice(rest, 0, e.settings.block_bytes))
+                    Err(_)  =>
+                        going = false
+                    Ok(blk) =>
+                        match stream_head(e.settings, started)
+                            Err(_)   =>
+                                // cov: skip — `stream_head` cannot refuse a check the settings already accepted
+                                going = false
+                            Ok(head) =>
+                                out = out + head + blk.bytes
+                                written = written + bytes.len(head) + bytes.len(blk.bytes)
+                                blocks = blocks + 1
+                                started = true
+                                records = list.push(records,
+                                    xzindex.record(blk.unpadded, blk.uncompressed))
+                                rest = bytes.slice(rest, e.settings.block_bytes,
+                                                   bytes.len(rest))
+        (XzEncoder { settings: e.settings, taken: took, written: written,
+                     blocks: blocks, started: started, pending: rest,
+                     records: records },
+                     out)
 
 // Close the stream: the last block, the index and the footer.
+//
+// `XzUnsupportedCheck` for a check type the format reserves and this
+// package cannot write, refused here rather than at the first block:
+// a stream with no blocks has none to build, and one written anyway
+// declares a check the reference decoder will not read — `xz -dc`
+// answers `Unsupported type of integrity check` and exits 2 for such
+// a file even when it is empty.
 //
 // ```novo
 // use std.bytes
@@ -237,7 +1161,35 @@ pub fn push(e: XzEncoder, chunk: Bytes) -> (XzEncoder, Bytes) []
 //         Err(e) => println(e.message())
 // ```
 pub fn close(e: XzEncoder) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzenc.close")
+    if not xzcheck.is_supported(e.settings.check)
+        return Err(xzerror.fault(XzUnsupportedCheck(e.settings.check),
+                                 xzerror.here(-1, -1, xzerror.XZ_LAYER_CHECK)))
+    let fl = match xzstream.flags(e.settings.check)
+        Err(f) =>
+            // cov: skip — `is_supported` refused anything `flags` would refuse
+            return Err(f)
+        Ok(x)  => x
+    var out = bytes.zeros(0)
+    if not e.started
+        out = out + xzstream.header_bytes(fl)
+    var records = list.clone(e.records)
+    if bytes.len(e.pending) > 0
+        let blk = match build_block(e.settings, e.pending)
+            Err(f) =>
+                // cov: skip — `is_supported` refused anything `build_block` would refuse
+                return Err(f)
+            Ok(b)  => b
+        out = out + blk.bytes
+        records = list.push(records, xzindex.record(blk.unpadded, blk.uncompressed))
+    let index = match xzindex.encode(xzindex.index(records))
+        Err(f) =>
+            // cov: skip — `encode`'s own pre-flight sizing is the only refusal it has
+            return Err(f)
+        Ok(b)  => b
+    match xzstream.footer_bytes(fl, bytes.len(index))
+        // cov: skip — the flags and a non-negative index length are all it reads
+        Err(f)   => Err(f)
+        Ok(tail) => Ok(out + index + tail)
 
 // Content bytes the encoder has taken.
 //
@@ -250,7 +1202,7 @@ pub fn close(e: XzEncoder) -> Result<Bytes, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn total_in(e: XzEncoder) -> Int []
-    todo("xz-nv.xzenc.total_in")
+    e.taken
 
 // How many blocks the encoder has closed.
 //
@@ -263,7 +1215,7 @@ pub fn total_in(e: XzEncoder) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn blocks_written(e: XzEncoder) -> Int []
-    todo("xz-nv.xzenc.blocks_written")
+    e.blocks
 
 // Compress a whole buffer at the default preset.
 //
@@ -277,7 +1229,10 @@ pub fn blocks_written(e: XzEncoder) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn compress(data: Bytes) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzenc.compress")
+    match settings(XZ_PRESET_DEFAULT)
+        // cov: skip — the default preset is inside the range `settings` accepts
+        Err(f) => Err(f)
+        Ok(s)  => compress_with(data, s)
 
 // Compress a whole buffer with settings of the caller's.
 //
@@ -294,13 +1249,23 @@ pub fn compress(data: Bytes) -> Result<Bytes, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn compress_with(data: Bytes, s: XzSettings) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzenc.compress_with")
+    let (e, head) = push(encoder(s), data)
+    match close(e)
+        Err(f)   => Err(f)
+        Ok(tail) => Ok(head + tail)
 
 // The largest output `n` bytes of content can compress to.
 //
 // `.xz` can EXPAND incompressible input — the container alone is
 // fifty-odd bytes — and a caller sizing a buffer needs the worst case
 // rather than a hope.
+//
+// The bound is this encoder's own and not a wish: a literal costs
+// eight modelled bits plus a flag, and the model adapts towards
+// whatever it is shown, so content that compresses to nothing at least
+// grows by under a tenth; the quarter here is that with room to
+// spare, and the 64 KiB is the container — a stream header, a block
+// header, a check, an index and a footer.
 //
 // ```novo
 // use xzenc
@@ -309,4 +1274,6 @@ pub fn compress_with(data: Bytes, s: XzSettings) -> Result<Bytes, XzFault> []
 //     println("${xzenc.compress_bound(1048576)}")
 // ```
 pub fn compress_bound(n: Int) -> Int []
-    todo("xz-nv.xzenc.compress_bound")
+    if n <= 0
+        return 1024
+    n + n / 4 + 65536

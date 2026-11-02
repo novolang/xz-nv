@@ -1,9 +1,6 @@
 // xzlzma.nv — LZMA1: the properties byte, the twelve-state machine,
 // the length and distance codes, and the legacy `.lzma` container.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // LZMA IS LZ77 WITH AN ADAPTIVE CONTEXT MODEL.  The output is a
 // sequence of literals and matches, exactly as in DEFLATE; what
 // differs is that every decision is a range-coded bit whose probability
@@ -43,7 +40,171 @@
 // It is read here because files exist; nothing writes it.
 
 use xzerror
+use xzfilter
 use xzrange
+
+// A fault naming a properties byte no model can be built for.
+fn bad_properties(got: Int) -> XzFault
+    xzerror.fault(XzBadLzmaProperties(got),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA))
+
+// A fault naming a parameter outside what a function allows.
+fn bad_parameter(what: Str) -> XzFault
+    xzerror.fault(XzBadParameter(what),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA))
+
+// A fault for a `.lzma` header whose filter properties are not ones the
+// format allows.
+//
+// Carries LZMA1's filter ID, which is what `.lzma` files are, and
+// `xzerror.is_corrupt` answers true for it.
+fn bad_alone_properties() -> XzFault
+    xzerror.fault(XzBadFilterProperties(xzfilter.XZ_FILTER_LZMA1),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA))
+
+// A fault naming a caller's buffer that was too small.
+fn buffer_too_small(want: Int, have: Int) -> XzFault
+    xzerror.fault(XzBufferTooSmall(want, have),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA))
+
+// A fault naming a match that reached past what exists.
+fn distance_too_far(distance: Int, available: Int) -> XzFault
+    xzerror.fault(XzDistanceTooFar(distance, available),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA))
+
+// A fault naming the range coder's invariant.
+fn bad_range(at: Int) -> XzFault
+    xzerror.fault(XzBadRangeCoder(at),
+                  xzerror.here(-1, at, xzerror.XZ_LAYER_LZMA))
+
+// One byte of a source, or zero past its end: the callers below have
+// already bounded what they read.
+fn byte_of(src: Bytes, k: Int) -> Int
+    bytes.byte_at(src, k) ?? 0
+
+// `n` bytes of a source, little-endian, OR-ed together rather than
+// summed: the eight-byte size field of a `.lzma` header is read into a
+// signed integer, where `0xFFFFFFFFFFFFFFFF` must land on `-1` rather
+// than overflow a `+`.
+fn rd_le(src: Bytes, k: Int, n: Int) -> Int
+    var acc = 0
+    var i = 0
+    while i < n
+        acc = acc | (byte_of(src, k + i) << (i * 8))
+        i = i + 1
+    acc
+
+// The probability at index `i` of a caller's array: two bytes, little
+// endian, eleven significant bits.
+//
+// Past the end of a short array it answers `XZ_PROB_INIT`, the value a
+// fresh array holds, rather than aborting: `probability_count` is what
+// says how big the array must be and a decoder is the wrong place to
+// fall over because a caller miscounted.
+fn prob_at(probs: Bytes, i: Int) -> Int
+    if i < 0 or i * 2 + 1 >= bytes.len(probs)
+        return XZ_PROB_INIT
+    byte_of(probs, i * 2) | (byte_of(probs, i * 2 + 1) << 8)
+
+// Write one back where it came from, if it came from inside the array.
+fn prob_put(var probs: Bytes, i: Int, v: Int)
+    if i < 0 or i * 2 + 1 >= bytes.len(probs)
+        return
+    bytes.set_u8(probs, i * 2, v)
+    bytes.set_u8(probs, i * 2 + 1, v >>> 8)
+
+// One modelled bit against `probs[i]`, with the adapted probability
+// written back.
+//
+// Every modelled bit in a symbol goes through here, so the write-back
+// and the "the coder ran out of source" flag are each written once.
+// A coder that has already run out answers zero without touching the
+// array: the caller is on its way out.
+fn bit_at(var probs: Bytes, i: Int, var coder: XzRange, src: Bytes, off: Int) -> Int
+    if not coder.ok
+        return 0
+    let step = xzrange.decode_bit(coder, prob_at(probs, i), src, off)
+    coder = step.coder
+    prob_put(var probs, i, step.prob)
+    step.bit
+
+// A bit tree of `n` levels, read high bit first, whose probabilities
+// `binary_tree` updates in place.
+fn tree_at(var probs: Bytes, at: Int, n: Int, var coder: XzRange, src: Bytes, off: Int) -> Int
+    let step = xzrange.decode_tree(coder, n, var probs, at, src, off)
+    coder = step.coder
+    step.bit
+
+// The same tree, read low bit first: LZMA's two distance tables, and
+// the reason `xzrange` publishes the reverse form separately.
+fn tree_rev_at(var probs: Bytes, at: Int, n: Int, var coder: XzRange, src: Bytes, off: Int) -> Int
+    let step = xzrange.decode_tree_reverse(coder, n, var probs, at, src, off)
+    coder = step.coder
+    step.bit
+
+// How many position states the model's arrays have room for: 16, the
+// maximum `pb` of four allows.
+//
+// THE ARRAY IS SIZED FOR THE MAXIMUM, which is what makes
+// `probability_count` an over-estimate at the default `pb = 2` and what
+// lets one array layout serve every `pb`: the decode uses the low
+// `pb` bits of the output position as an INDEX into a row of sixteen.
+const XZ_POS_STATES = 16
+
+// How many match-length probability sets a distance has: 4, one each
+// for lengths 2, 3, 4 and `5` and over.
+const XZ_DIST_STATES = 4
+
+// How many trees the `pos_special` table holds: 114, one for each
+// distance below 128 above the first four slots.
+const XZ_POS_SPECIAL_COUNT = 114
+
+// One length decoder: two choice bits, three trees of three bits with a
+// row per position state, and an eight-bit tree for the long lengths.
+const XZ_LEN_DECODER_SIZE = 2 + XZ_POS_STATES * 8 + XZ_POS_STATES * 8 + 256
+
+// WHERE EACH MODEL SITS IN THE CALLER'S ARRAY.
+//
+// The order is xz's own `lzma_lzma1_decoder` field order, because that
+// is the order every other implementation of the format numbers them
+// in.  Literals first — one 0x300-probability coder for each
+// `lc`+`lp`-bit context — then the flags, then the distance tables,
+// then the two length decoders.
+//
+// The literal part is the only one that moves with the parameters, and
+// it is the one at the bottom, so every offset above it is a DELTA from
+// its end: the tables start at the literal part's last index and this
+// holds at every `lc`, `lp` and `pb` rather than only at the default.
+// `decode_symbol_props` is what adds the literal half on.
+const XZ_IS_MATCH_AT = 0
+const XZ_IS_REP_AT = XZ_IS_MATCH_AT + XZ_STATES * XZ_POS_STATES
+const XZ_IS_REP0_AT = XZ_IS_REP_AT + XZ_STATES
+const XZ_IS_REP1_AT = XZ_IS_REP0_AT + XZ_STATES
+const XZ_IS_REP2_AT = XZ_IS_REP1_AT + XZ_STATES
+const XZ_IS_REP0_LONG_AT = XZ_IS_REP2_AT + XZ_STATES
+const XZ_DIST_SLOT_AT = XZ_IS_REP0_LONG_AT + XZ_STATES * XZ_POS_STATES
+const XZ_POS_SPECIAL_AT = XZ_DIST_SLOT_AT + XZ_DIST_STATES * XZ_DIST_SLOTS
+const XZ_POS_ALIGN_AT = XZ_POS_SPECIAL_AT + XZ_POS_SPECIAL_COUNT
+const XZ_MATCH_LEN_AT = XZ_POS_ALIGN_AT + 16
+const XZ_REP_LEN_AT = XZ_MATCH_LEN_AT + XZ_LEN_DECODER_SIZE
+
+// How many probabilities the tables above occupy: 1,846.
+const XZ_MODEL_TABLES = XZ_REP_LEN_AT + XZ_LEN_DECODER_SIZE
+
+// The literal half at the default parameters: 6,144.
+const XZ_LC_LITERAL_HALF = 0x300 << (XZ_LC_DEFAULT + XZ_LP_DEFAULT)
+
+// How many probabilities sit above the literal part: 7,990.
+//
+// THE RELEASED DESIGN'S NUMBER, and it is larger than the tables need:
+// the tables are `XZ_MODEL_TABLES` = 1,846 of them, so 6,144 of the
+// region is headroom.  It is what `probability_count` adds to a scaled
+// literal half to reach the 14,134 the released tests pin at the
+// default, and `decode_symbol` therefore indexes the tables from the
+// literal part's end rather than from 12,288, which is where a direct
+// transcription of the C would put them.  Changing it changes
+// `probability_count`, which the released oracle asserts, so it stays.
+const PROB_MODEL_REST = XZ_LC_LITERAL_HALF + XZ_MODEL_TABLES
 
 // The most `lc + lp` may be: 4.
 pub const XZ_LCLP_MOST = 4
@@ -120,7 +281,19 @@ pub struct XzLzmaProps
 //         Err(e) => println(e.message())
 // ```
 pub fn properties(b: Int) -> Result<XzLzmaProps, XzFault> []
-    todo("xz-nv.xzlzma.properties")
+    if b < 0 or b > 224
+        return Err(bad_properties(b))
+    // The byte is `(pb * 5 + lp) * 9 + lc`, and two divisions undo it.
+    // A byte above 224 leaves `lc` at eight, which the `lc + lp` check
+    // below refuses as well; the ceiling is written out so that the
+    // byte is refused for the reason a caller sees.
+    let lc = b % 9
+    let rest = b / 9
+    let lp = rest % 5
+    let pb = rest / 5
+    if lc + lp > XZ_LCLP_MOST
+        return Err(bad_properties(b))
+    Ok(XzLzmaProps { lc: lc, lp: lp, pb: pb })
 
 // The properties byte a set of parameters encodes to.
 //
@@ -133,7 +306,16 @@ pub fn properties(b: Int) -> Result<XzLzmaProps, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn properties_byte(lc: Int, lp: Int, pb: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzlzma.properties_byte")
+    if lc < 0 or lc > XZ_LCLP_MOST or lp < 0 or lp > XZ_LCLP_MOST
+            or pb < 0 or pb > 4
+        return Err(bad_parameter("lc, lp and pb are each 0 to 4"))
+    let b = (pb * 5 + lp) * 9 + lc
+    if lc + lp > XZ_LCLP_MOST
+        // The byte the triple would encode to, and no decoder can build
+        // a model for it — the same fault `properties` answers for the
+        // same byte.
+        return Err(bad_properties(b))
+    Ok(b)
 
 // How many probabilities a model with these parameters needs.
 //
@@ -154,7 +336,11 @@ pub fn properties_byte(lc: Int, lp: Int, pb: Int) -> Result<Int, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn probability_count(p: XzLzmaProps) -> Int []
-    todo("xz-nv.xzlzma.probability_count")
+    // The literal part scales with `lc + lp`; everything above it is a
+    // constant, and it is a constant at the LARGEST `pb` — see
+    // `XZ_POS_STATES`.  A `pb` below four therefore leaves rows of the
+    // flags unused rather than making the array smaller.
+    (0x300 << (p.lc + p.lp)) + PROB_MODEL_REST
 
 // How many bytes a probability array of `n` entries occupies.
 //
@@ -170,7 +356,7 @@ pub fn probability_count(p: XzLzmaProps) -> Int []
 //     println("${xzlzma.probability_bytes(14134)}")
 // ```
 pub fn probability_bytes(n: Int) -> Int []
-    todo("xz-nv.xzlzma.probability_bytes")
+    n * 2
 
 // Set every probability in a caller's array to `XZ_PROB_INIT`.
 //
@@ -186,8 +372,15 @@ pub fn probability_bytes(n: Int) -> Int []
 //         Ok(b)  => println("${bytes.len(b)}")
 //         Err(e) => println(e.message())
 // ```
-pub fn reset_probabilities(probs: Bytes, n: Int) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzlzma.reset_probabilities")
+pub fn reset_probabilities(var probs: Bytes, n: Int) -> Result<Bytes, XzFault> []
+    let want = probability_bytes(n)
+    if n < 0 or bytes.len(probs) < want
+        return Err(buffer_too_small(want, bytes.len(probs)))
+    var i = 0
+    while i < n
+        prob_put(var probs, i, xzrange.XZ_PROB_INIT)
+        i = i + 1
+    Ok(probs)
 
 // The state after a literal.
 //
@@ -202,7 +395,17 @@ pub fn reset_probabilities(probs: Bytes, n: Int) -> Result<Bytes, XzFault> []
 //     println("${xzlzma.next_state_literal(0)}")
 // ```
 pub fn next_state_literal(state: Int) -> Int []
-    todo("xz-nv.xzlzma.next_state_literal")
+    // Four states mean the last three symbols were all literals, and
+    // one literal more leaves the machine where it was.  The rest fall
+    // back by three or by six: by three when the symbol before the
+    // literal was one, by six when two were.
+    if state <= 3
+        0
+    else
+        if state <= 9
+            state - 3
+        else
+            state - 6
 
 // The state after a new-distance match.
 //
@@ -213,7 +416,10 @@ pub fn next_state_literal(state: Int) -> Int []
 //     println("${xzlzma.next_state_match(0)}")
 // ```
 pub fn next_state_match(state: Int) -> Int []
-    todo("xz-nv.xzlzma.next_state_match")
+    if state < 7
+        7
+    else
+        10
 
 // The state after a rep match — one that names a remembered distance.
 //
@@ -224,7 +430,10 @@ pub fn next_state_match(state: Int) -> Int []
 //     println("${xzlzma.next_state_rep(0)}")
 // ```
 pub fn next_state_rep(state: Int) -> Int []
-    todo("xz-nv.xzlzma.next_state_rep")
+    if state < 7
+        8
+    else
+        11
 
 // The state after a short rep — a single byte at the last distance.
 //
@@ -235,7 +444,10 @@ pub fn next_state_rep(state: Int) -> Int []
 //     println("${xzlzma.next_state_short_rep(0)}")
 // ```
 pub fn next_state_short_rep(state: Int) -> Int []
-    todo("xz-nv.xzlzma.next_state_short_rep")
+    if state < 7
+        9
+    else
+        11
 
 // Whether a state means the last symbol was a literal.
 //
@@ -248,7 +460,7 @@ pub fn next_state_short_rep(state: Int) -> Int []
 //     println("${xzlzma.state_is_literal(0)}")
 // ```
 pub fn state_is_literal(state: Int) -> Bool []
-    todo("xz-nv.xzlzma.state_is_literal")
+    state < 7
 
 // The four remembered match distances.
 //
@@ -274,7 +486,11 @@ struct XzRepDistances
 //     println("${xzlzma.reps_start().r0}")
 // ```
 pub fn reps_start() -> XzRepDistances []
-    todo("xz-nv.xzlzma.reps_start")
+    // All four at zero, which is what a decoder's state reset leaves
+    // them at.  Zero is a real distance — the byte before the write
+    // point — and a rep naming it before any output exists is refused
+    // by `check_distance`, so nothing is read that was never written.
+    XzRepDistances { r0: 0, r1: 0, r2: 0, r3: 0 }
 
 // Push a new distance to the front, dropping the oldest.
 //
@@ -285,7 +501,7 @@ pub fn reps_start() -> XzRepDistances []
 //     println("${xzlzma.reps_push(xzlzma.reps_start(), 17).r0}")
 // ```
 pub fn reps_push(r: XzRepDistances, distance: Int) -> XzRepDistances []
-    todo("xz-nv.xzlzma.reps_push")
+    XzRepDistances { r0: distance, r1: r.r0, r2: r.r1, r3: r.r2 }
 
 // Move the distance at index `i` to the front, as a rep match does.
 //
@@ -301,7 +517,19 @@ pub fn reps_push(r: XzRepDistances, distance: Int) -> XzRepDistances []
 //     println("${xzlzma.reps_use(xzlzma.reps_start(), 2).r0}")
 // ```
 pub fn reps_use(r: XzRepDistances, i: Int) -> XzRepDistances []
-    todo("xz-nv.xzlzma.reps_use")
+    // Naming the nth distance moves it to the front and pushes the ones
+    // in front of it back, which is what keeps a file whose matches
+    // alternate between two distances cheap.
+    if i <= 0
+        r
+    else
+        if i == 1
+            XzRepDistances { r0: r.r1, r1: r.r0, r2: r.r2, r3: r.r3 }
+        else
+            if i == 2
+                XzRepDistances { r0: r.r2, r1: r.r0, r2: r.r1, r3: r.r3 }
+            else
+                XzRepDistances { r0: r.r3, r1: r.r0, r2: r.r1, r3: r.r2 }
 
 // The distance at index `i` of the remembered four.
 //
@@ -312,7 +540,18 @@ pub fn reps_use(r: XzRepDistances, i: Int) -> XzRepDistances []
 //     println("${xzlzma.reps_at(xzlzma.reps_start(), 0)}")
 // ```
 pub fn reps_at(r: XzRepDistances, i: Int) -> Int []
-    todo("xz-nv.xzlzma.reps_at")
+    // An index outside the four answers the nearest one: the decoder
+    // derives it from two bits and cannot ask for a fifth.
+    if i <= 0
+        r.r0
+    else
+        if i == 1
+            r.r1
+        else
+            if i == 2
+                r.r2
+            else
+                r.r3
 
 // How many direct bits a distance slot carries after its two high
 // bits.
@@ -332,7 +571,15 @@ pub fn reps_at(r: XzRepDistances, i: Int) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn slot_extra_bits(slot: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzlzma.slot_extra_bits")
+    if slot < 0 or slot >= XZ_DIST_SLOTS
+        return Err(bad_parameter("a distance slot is 0 to 63"))
+    if slot < 4
+        // The first four slots ARE the distance, in full.
+        Ok(0)
+    else
+        // From slot four up, the slot names a power of two and this
+        // many bits name the offset inside it.
+        Ok((slot >>> 1) - 1)
 
 // The base distance a slot starts at.
 //
@@ -345,7 +592,32 @@ pub fn slot_extra_bits(slot: Int) -> Result<Int, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn slot_base(slot: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzlzma.slot_base")
+    if slot < 0 or slot >= XZ_DIST_SLOTS
+        return Err(bad_parameter("a distance slot is 0 to 63"))
+    if slot < 4
+        Ok(slot)
+    else
+        // `(2 | slot & 1) << footer`, which is the smallest distance the
+        // slot can name: two bits of the leading value, shifted up by
+        // the bits the slot carries below them.
+        Ok((2 | (slot & 1)) << ((slot >>> 1) - 1))
+
+// The byte before the write point, or zero at the very start of the
+// output: the two contexts a literal is coded against are this byte and
+// the position.
+fn prev_byte(dst: Bytes, out: Int) -> Int
+    if out > 0
+        byte_of(dst, out - 1)
+    else
+        0
+
+// The bytes a match may reach back into: what exists, or what the
+// dictionary holds, whichever is smaller.
+fn reachable(produced: Int, dict_bytes: Int) -> Int
+    if produced < dict_bytes
+        produced
+    else
+        dict_bytes
 
 // Whether a distance can be used, given how much output exists and how
 // large the dictionary is.
@@ -364,7 +636,14 @@ pub fn slot_base(slot: Int) -> Result<Int, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn check_distance(distance: Int, produced: Int, dict_bytes: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzlzma.check_distance")
+    // A distance of `d` names the byte `d` positions behind the write
+    // point, so it needs `d + 1` bytes of output — and no more than the
+    // dictionary holds, because a decoder that keeps a window smaller
+    // than the file cannot reach past it either.
+    let available = reachable(produced, dict_bytes)
+    if distance < 0 or distance >= available
+        return Err(distance_too_far(distance, available))
+    Ok(distance)
 
 // The legacy `.lzma` container's thirteen-byte header.
 //
@@ -391,7 +670,8 @@ pub struct XzAloneHeader
 // `src`.
 //
 // `XzBadLzmaProperties` for a properties byte the format does not
-// allow, and `XzBadParameter` for a dictionary size of zero.
+// allow, and `XzBadFilterProperties` — naming LZMA1, which is what the
+// file is — for a dictionary size of zero, which is no dictionary.
 //
 // THERE IS NO MAGIC AND NO CHECKSUM, which is worth knowing before
 // trusting the result: a `.lzma` file cannot be recognised by
@@ -408,7 +688,25 @@ pub struct XzAloneHeader
 //         Err(e) => println(e.message())
 // ```
 pub fn read_alone_header(src: Bytes) -> Result<XzAloneHeader, XzFault> []
-    todo("xz-nv.xzlzma.read_alone_header")
+    if bytes.len(src) < XZ_LZMA_ALONE_HEADER_BYTES
+        return Err(xzerror.fault(
+            XzTruncated(XZ_LZMA_ALONE_HEADER_BYTES - bytes.len(src)),
+            xzerror.here(-1, bytes.len(src), xzerror.XZ_LAYER_LZMA)))
+    match properties(byte_of(src, 0))
+        Err(f) => Err(f)
+        Ok(p)  =>
+            let dict_bytes = rd_le(src, 1, 4)
+            if dict_bytes == 0
+                return Err(bad_alone_properties())
+            let size = rd_le(src, 5, 8)
+            if size < 0 and size != XZ_SIZE_UNKNOWN
+                // The size field is a multibyte integer, and the format
+                // reserves its top bit: the one value above the ceiling
+                // that is legal is all ones, the unknown size.
+                return Err(xzerror.fault(
+                    XzBadVli(5), xzerror.here(-1, 5, xzerror.XZ_LAYER_LZMA)))
+            Ok(XzAloneHeader { props: p, dict_bytes: dict_bytes,
+                               uncompressed_size: size })
 
 // Whether a legacy header declares its uncompressed size.
 //
@@ -426,7 +724,23 @@ pub fn read_alone_header(src: Bytes) -> Result<XzAloneHeader, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn alone_size_known(h: XzAloneHeader) -> Bool []
-    todo("xz-nv.xzlzma.alone_size_known")
+    h.uncompressed_size != XZ_SIZE_UNKNOWN
+
+// A fault naming a stream that wanted more output than its header
+// declared.
+fn size_mismatch(declared: Int, actual: Int) -> XzFault
+    xzerror.fault(XzSizeMismatch(declared, actual),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA))
+
+// The coder with one more byte pulled in, if it wants one.
+//
+// What "did the stream stop in the right place" asks: a range encoder
+// flushes five bytes at the end and a decoder pulls them in one
+// normalization at a time, so the last of them may still be unread when
+// the code has already reached zero.  One bit decode is the pull — its
+// answer is thrown away, and the probability it took by value with it.
+fn settled(r: XzRange, src: Bytes, off: Int) -> XzRange
+    xzrange.decode_bit(r, xzrange.XZ_PROB_INIT, src, off).coder
 
 // Decompress a whole legacy `.lzma` file held in memory.
 //
@@ -445,7 +759,259 @@ pub fn alone_size_known(h: XzAloneHeader) -> Bool []
 //         Err(e) => println(e.message())
 // ```
 pub fn decompress_alone(data: Bytes, limit: Int) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzlzma.decompress_alone")
+    match read_alone_header(data)
+        Err(f) => Err(f)
+        Ok(h)  =>
+            if alone_size_known(h) and limit >= 0 and h.uncompressed_size > limit
+                return Err(xzerror.fault(
+                    XzLimitReached(h.uncompressed_size, limit),
+                    xzerror.here(-1, 0, xzerror.XZ_LAYER_LZMA)))
+            let count = probability_count(h.props)
+            var probs = bytes.zeros(probability_bytes(count))
+            match reset_probabilities(var probs, count)
+                // cov: skip — the count is the one the header's own properties ask for
+                Err(f) => Err(f)
+                Ok(_)  => run_alone(data, h, limit, var probs)
+
+// How large the output buffer starts: the declared size when the header
+// gives one and it is smaller than the initial window, the initial
+// window otherwise, and never more than the caller allowed.
+//
+// The declared size is not allocated up front, because a `.lzma` header
+// may declare a size far larger than the file's content and nothing
+// checks it but the decoder itself.
+fn initial_cap(h: XzAloneHeader, limit: Int) -> Int
+    var cap = 65536
+    if alone_size_known(h) and h.uncompressed_size < cap
+        cap = h.uncompressed_size
+    if limit >= 0 and limit < cap
+        cap = limit
+    if cap < 1
+        cap = 1
+    cap
+
+// How much room the output needs for the next symbol.
+//
+// Answers the capacity, and allocates nothing: the buffer is grown by
+// the caller, in the frame that owns the variable.  A `var` parameter
+// shares its bytes with the caller but not its binding, so a helper
+// that rebinds one has grown nothing the caller can see.
+//
+// The answer is always at least `produced + XZ_MATCH_LEN_MOST`, so a
+// symbol that starts inside the buffer has room for the longest match
+// the format has.  That is what lets a symbol that overruns be a real
+// fault rather than a signal to grow and try again — a retry would
+// adapt the model twice for one symbol.
+//
+// The common case allocates nothing, and it has to be that way: a
+// buffer that doubled whenever asked would double once per symbol and
+// reach any limit in a few hundred of them, whatever the output size.
+//
+// A header that declared its size is its own ceiling when that size can
+// still hold one more symbol.  A declared size below that is not a
+// ceiling at all — the room beyond it is what lets the overrun be seen.
+fn grown_capacity(buf: Bytes, produced: Int, h: XzAloneHeader,
+                  limit: Int) -> Result<Int, XzFault> []
+    let need = produced + XZ_MATCH_LEN_MOST
+    if need <= bytes.len(buf)
+        return Ok(bytes.len(buf))
+    var want = bytes.len(buf) * 2
+    if want < need
+        want = need
+    if alone_size_known(h) and h.uncompressed_size < want and h.uncompressed_size >= need
+        want = h.uncompressed_size
+    if limit >= 0 and want > limit
+        return Err(xzerror.fault(XzLimitReached(want, limit),
+                                 xzerror.here(-1, produced, xzerror.XZ_LAYER_LZMA)))
+    Ok(want)
+
+// The symbol loop of a `.lzma` file.
+fn run_alone(data: Bytes, h: XzAloneHeader, limit: Int,
+             var probs: Bytes) -> Result<Bytes, XzFault> []
+    let off = XZ_LZMA_ALONE_HEADER_BYTES
+    let first = xzrange.start(data, off)
+    match xzrange.start_fault(first, off)
+        Some(f) => Err(f)
+        None    =>
+            var coder = first
+            var state = 0
+            var reps = reps_start()
+            var produced = 0
+            var buf = bytes.zeros(initial_cap(h, limit))
+            var done = false
+            while not done
+                // All the bytes the header promised are written.  A
+                // file that declares its size need write no end marker
+                // of its own: when the coder has settled, the stream is
+                // over.  One that wrote the marker anyway has it as the
+                // next symbol, and THE REFERENCE DECODER READS THAT AS
+                // THE END — `xz --format=lzma -dc` accepts a both-ways
+                // file and refuses one whose marker arrives with a byte
+                // still promised — so the loop stops here only when the
+                // coder says the stream is over, and a symbol read past
+                // the boundary is the header's lie.
+                if alone_size_known(h) and produced == h.uncompressed_size
+                    let last = settled(coder, data, off)
+                    if last.ok and xzrange.is_clean(last)
+                        done = true
+                if not done
+                    match grown_capacity(buf, produced, h, limit)
+                        Err(f)   =>
+                            return Err(f)
+                        Ok(want) =>
+                            if want > bytes.len(buf)
+                                // THE BUFFER IS GROWN HERE, in the frame
+                                // that owns the variable.  A `var`
+                                // parameter shares its bytes with its
+                                // caller but not its binding: a callee
+                                // that rebinds one grows nothing the
+                                // caller can see, and the next symbol
+                                // would write into the buffer that was
+                                // thrown away.
+                                var bigger = bytes.zeros(want)
+                                bytes.copy_into(bigger, 0, buf, 0, produced)
+                                buf = bigger
+                            let s = decode_symbol_props(h.props, coder, state, reps, var probs,
+                                                        data, off, var buf, produced)
+                            if s.fault == XZ_SYMBOL_FAULT_BUFFER
+                                // The symbol wanted more room than the
+                                // header declared.
+                                // cov: skip — `grown_capacity` leaves room for the longest match before every symbol
+                                return Err(size_mismatch(h.uncompressed_size, produced))
+                            if s.fault == XZ_SYMBOL_FAULT_DISTANCE
+                                // `decode_symbol` checks a distance against
+                                // the output alone; the dictionary the
+                                // header names is the other half of the
+                                // bound, and it is checked here where it is
+                                // known.
+                                if s.reps.r0 >= h.dict_bytes
+                                    return Err(distance_too_far(s.reps.r0, h.dict_bytes))
+                                return Err(distance_too_far(s.reps.r0, s.produced))
+                            if s.fault == XZ_SYMBOL_FAULT_RANGE
+                                return Err(bad_range(off))
+                            coder = s.coder
+                            state = s.state
+                            reps = s.reps
+                            produced = s.produced
+                            if s.ended
+                                if alone_size_known(h) and produced != h.uncompressed_size
+                                    // The marker ended a stream that had
+                                    // not written everything the header
+                                    // promised: the size and the marker
+                                    // disagree, and the coder is
+                                    // settled either way, so this is
+                                    // the only place the lie shows.
+                                    return Err(size_mismatch(h.uncompressed_size, produced))
+                                done = true
+                            else if alone_size_known(h) and produced > h.uncompressed_size
+                                // The header promised a size and the
+                                // stream has now written past it.  The
+                                // boundary above is the other way to
+                                // disagree.
+                                return Err(size_mismatch(h.uncompressed_size, produced))
+            let last = settled(coder, data, off)
+            if not last.ok
+                // cov: skip — a stream that runs out faults inside the symbol it ran out in, and stopping on a symbol boundary with no flush bytes is what reaching this needs
+                return Err(xzerror.fault(
+                    XzTruncated(1),
+                    xzerror.here(-1, bytes.len(data), xzerror.XZ_LAYER_LZMA)))
+            if not xzrange.is_clean(last)
+                return Err(bad_range(off))
+            Ok(bytes.slice(buf, 0, produced))
+
+// A symbol that stopped early, with the code saying why.
+fn stopped(coder: XzRange, st: Int, d: XzRepDistances, out: Int, code: Int) -> XzSymbol
+    XzSymbol { coder: coder, state: st, reps: d, produced: out,
+               ended: false, fault: code }
+
+// A symbol that was decoded.
+fn decoded(coder: XzRange, st: Int, d: XzRepDistances, out: Int) -> XzSymbol
+    XzSymbol { coder: coder, state: st, reps: d, produced: out,
+               ended: false, fault: XZ_SYMBOL_FAULT_NONE }
+
+// The end marker.
+fn ended_at(coder: XzRange, st: Int, d: XzRepDistances, out: Int) -> XzSymbol
+    XzSymbol { coder: coder, state: st, reps: d, produced: out,
+               ended: true, fault: XZ_SYMBOL_FAULT_NONE }
+
+// The four remembered distances of a symbol that refused one, with the
+// refused distance at the front so `symbol_fault` can name it.
+fn refused(d: XzRepDistances, distance: Int) -> XzRepDistances
+    XzRepDistances { r0: distance, r1: d.r1, r2: d.r2, r3: d.r3 }
+
+// Which distance table a match of this length uses: 2, 3, 4 and `5` and
+// over are four separate sets of probabilities, because a short match
+// is worth coding differently from a long one.
+fn dist_state(len: Int) -> Int
+    if len < 6
+        len - XZ_MATCH_LEN_LEAST
+    else
+        XZ_DIST_STATES - 1
+
+// A match length: two choice bits, then a three-bit tree for the short
+// lengths, a second three-bit tree for the middle ones, or an eight-bit
+// tree for the long ones.
+fn length_at(var probs: Bytes, base: Int, pos: Int, var coder: XzRange, src: Bytes, off: Int) -> Int
+    if bit_at(var probs, base, var coder, src, off) == 0
+        XZ_MATCH_LEN_LEAST
+            + tree_at(var probs, base + 2 + pos * 8, 3, var coder, src, off)
+    else
+        if bit_at(var probs, base + 1, var coder, src, off) == 0
+            XZ_MATCH_LEN_LEAST + 8
+                + tree_at(var probs, base + 130 + pos * 8, 3, var coder, src, off)
+        else
+            XZ_MATCH_LEN_LEAST + 16
+                + tree_at(var probs, base + 258, 8, var coder, src, off)
+
+// A match distance from its slot: the first four slots are the distance
+// itself, and from there the slot's two high bits give a base and the
+// rest of the distance is a little-endian tree below it — the
+// probability-modelled part, then the direct bits, then the four
+// aligned ones that no model is worth.
+fn distance_of(var probs: Bytes, lit: Int, slot: Int, var coder: XzRange, src: Bytes,
+               off: Int) -> Int
+    if slot < 4
+        slot
+    else
+        let footer = (slot >>> 1) - 1
+        let base = (2 | (slot & 1)) << footer
+        if slot < 14
+            base + tree_rev_at(var probs, lit + XZ_POS_SPECIAL_AT + base - slot - 1,
+                               footer, var coder, src, off)
+        else
+            let direct = xzrange.decode_direct(coder, footer - 4, src, off)
+            coder = direct.coder
+            base + (direct.bit << 4)
+                + tree_rev_at(var probs, lit + XZ_POS_ALIGN_AT, 4, var coder, src, off)
+
+// Repeat `n` bytes of the output from `distance` behind the write point
+// — the copy both a match and a rep end in.
+//
+// The ranges overlap whenever the distance is shorter than the run,
+// which is the normal case for LZMA and the reason the copy walks
+// forwards byte by byte: a run of one repeated byte is a distance of
+// zero and a length of a thousand.
+fn copied(var dst: Bytes, coder: XzRange, st: Int, d: XzRepDistances, out: Int, distance: Int,
+          n: Int) -> XzSymbol
+    if out + n > bytes.len(dst)
+        return stopped(coder, st, d, out, XZ_SYMBOL_FAULT_BUFFER)
+    // THE COPY IS NOT A memmove.  A match whose length exceeds its
+    // distance repeats its own output — that is how LZMA encodes a run,
+    // and it is the most common match in real data.  `bytes.copy_within`
+    // copies the source range as it stood before the write, so a
+    // distance-one match of sixty-nine would expand to one byte and
+    // sixty-eight zeros.  Only a distance at least as long as the match
+    // leaves the two ranges disjoint, and there `copy_within` is both
+    // right and much faster.
+    if distance + 1 >= n
+        bytes.copy_within(dst, out, out - distance - 1, n)
+        return decoded(coder, st, d, out + n)
+    var from = out - distance - 1
+    var k = 0
+    while k < n
+        bytes.set_u8(dst, out + k, byte_of(dst, from + k))
+        k = k + 1
+    decoded(coder, st, d, out + n)
 
 // Decode one LZMA symbol against a caller's model and dictionary.
 //
@@ -458,6 +1024,13 @@ pub fn decompress_alone(data: Bytes, limit: Int) -> Result<Bytes, XzFault> []
 // already produced, so there is no separate window to copy into and
 // no way for this package to size one on a caller's behalf.
 //
+// Carries the default `lc`, `lp` and `pb` and nothing else, because the
+// signature is the one the released tests call.  A stream whose
+// properties byte says otherwise — every LZMA2 chunk that changes them,
+// and a `.lzma` file written with non-default ones — is decoded by
+// `decode_symbol_props`, which is this function with the parameters
+// named.
+//
 // ```novo
 // use std.bytes
 // use xzlzma
@@ -469,9 +1042,149 @@ pub fn decompress_alone(data: Bytes, limit: Int) -> Result<Bytes, XzFault> []
 //                                  bytes.zeros(16), 0, bytes.zeros(64), 0)
 //     println("${s.state}")
 // ```
-pub fn decode_symbol(r: XzRange, state: Int, reps: XzRepDistances, probs: Bytes, src: Bytes,
-                     off: Int, dst: Bytes, produced: Int) -> XzSymbol []
-    todo("xz-nv.xzlzma.decode_symbol")
+pub fn decode_symbol(r: XzRange, state: Int, reps: XzRepDistances, var probs: Bytes, src: Bytes,
+                     off: Int, var dst: Bytes, produced: Int) -> XzSymbol []
+    match properties(props_byte_of_defaults())
+        // cov: skip — the module's own defaults always have properties
+        Err(_) => stopped(r, state, reps, produced, XZ_SYMBOL_FAULT_RANGE)
+        Ok(p)  => decode_symbol_props(p, r, state, reps, var probs, src, off, var dst, produced)
+
+// The properties byte the three defaults encode to: `0x5D`.
+fn props_byte_of_defaults() -> Int
+    (XZ_PB_DEFAULT * 5 + XZ_LP_DEFAULT) * 9 + XZ_LC_DEFAULT
+
+// Decode one LZMA symbol against a model whose parameters are named.
+//
+// THE SAME SYMBOL EITHER WAY, and this is the implementation the other
+// one calls.  The three parameters reach the model in two places: the
+// literal coder is selected by `lp` bits of the output position and
+// `lc` bits of the byte before it, and the position state by the low
+// `pb` bits of the output position.  Everything else — the state
+// machine, the four distances, the length and distance trees — is the
+// same at every setting, which is why one function serves them all.
+//
+// ```novo
+// use std.bytes
+// use xzlzma
+// use xzrange
+//
+// fn main() [io]
+//     match xzlzma.properties(0x5D)
+//         Ok(p)  =>
+//             let s = xzlzma.decode_symbol_props(p, xzrange.start(bytes.zeros(5), 0), 0,
+//                                                xzlzma.reps_start(), bytes.zeros(64),
+//                                                bytes.zeros(16), 0, bytes.zeros(64), 0)
+//             println("${s.state}")
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_symbol_props(p: XzLzmaProps, r: XzRange, state: Int, reps: XzRepDistances,
+                           var probs: Bytes, src: Bytes, off: Int, var dst: Bytes,
+                           produced: Int) -> XzSymbol []
+    var coder = r
+    var st = state
+    var d = reps
+    var out = produced
+    // Where the tables above the literals start, and the two contexts
+    // the model is selected by: the low `pb` bits of the output
+    // position, and the `lp`-bit position and `lc`-bit previous byte
+    // that between them choose a literal coder.
+    let lit = 0x300 << (p.lc + p.lp)
+    let pos = out & ((1 << p.pb) - 1)
+    if bit_at(var probs, lit + XZ_IS_MATCH_AT + st * XZ_POS_STATES + pos,
+              var coder, src, off) == 0
+        // A literal: one byte through an eight-bit tree, and which tree
+        // is a context of its own.
+        let prev = prev_byte(dst, out)
+        let base = (((out & ((1 << p.lp) - 1)) << p.lc)
+                    + (prev >> (8 - p.lc))) * 0x300
+        var symbol = 1
+        if state_is_literal(st)
+            // Nothing matched lately, so the tree walks on its own.
+            var k = 0
+            while k < 8 and coder.ok
+                symbol = symbol * 2 + bit_at(var probs, base + symbol, var coder, src, off)
+                k = k + 1
+        else
+            // A literal straight after a match is coded against the byte
+            // the current distance points at, one bit of it at a time:
+            // the tree is selected by the matching byte's high bits
+            // while they agree with the literal's, and by nothing once
+            // they disagree.  `offs` going to zero IS that "once".
+            var against = byte_of(dst, out - d.r0 - 1) << 1
+            var offs = 0x100
+            var k = 0
+            while k < 8 and coder.ok
+                let mb = against & offs
+                let b = bit_at(var probs, base + offs + mb + symbol, var coder, src, off)
+                if b == 0
+                    offs = offs & ~mb
+                else
+                    offs = offs & mb
+                symbol = symbol * 2 + b
+                against = against << 1
+                k = k + 1
+        if not coder.ok
+            return stopped(coder, st, d, out, XZ_SYMBOL_FAULT_RANGE)
+        if out >= bytes.len(dst)
+            return stopped(coder, st, d, out, XZ_SYMBOL_FAULT_BUFFER)
+        bytes.set_u8(dst, out, symbol - 0x100)
+        return decoded(coder, next_state_literal(st), d, out + 1)
+    else
+        if bit_at(var probs, lit + XZ_IS_REP_AT + st, var coder, src, off) == 0
+            // A match at a distance that has not been used lately: the
+            // four are pushed down and the new one goes to the front.
+            st = next_state_match(st)
+            let len = length_at(var probs, lit + XZ_MATCH_LEN_AT, pos, var coder, src, off)
+            let slot = tree_at(var probs, lit + XZ_DIST_SLOT_AT + dist_state(len) * XZ_DIST_SLOTS,
+                               6, var coder, src, off)
+            let dist = distance_of(var probs, lit, slot, var coder, src, off)
+            d = reps_push(d, dist)
+            if dist == XZ_END_MARKER_DISTANCE
+                // The end marker, which a `.lzma` file with an unknown
+                // size carries and an LZMA2 chunk never does.
+                return ended_at(coder, st, d, out)
+            if not coder.ok
+                return stopped(coder, st, d, out, XZ_SYMBOL_FAULT_RANGE)
+            if dist >= out
+                return stopped(coder, st, refused(d, dist), out, XZ_SYMBOL_FAULT_DISTANCE)
+            return copied(var dst, coder, st, d, out, dist, len)
+        else
+            // A rep: one of the four distances already remembered, which
+            // costs a few bits where a new one costs thirty.
+            if out == 0
+                return stopped(coder, st, refused(d, 0), out, XZ_SYMBOL_FAULT_DISTANCE)
+            var which = 0
+            if bit_at(var probs, lit + XZ_IS_REP0_AT + st, var coder, src, off) == 0
+                if bit_at(var probs, lit + XZ_IS_REP0_LONG_AT + st * XZ_POS_STATES + pos,
+                          var coder, src, off) == 0
+                    // A short rep: one byte at the last distance, which
+                    // is the cheapest match the format has.
+                    st = next_state_short_rep(st)
+                    if not coder.ok
+                        return stopped(coder, st, d, out, XZ_SYMBOL_FAULT_RANGE)
+                    return copied(var dst, coder, st, d, out, d.r0, 1)
+                else
+                    which = 0
+            else
+                if bit_at(var probs, lit + XZ_IS_REP1_AT + st, var coder, src, off) == 0
+                    which = 1
+                else
+                    if bit_at(var probs, lit + XZ_IS_REP2_AT + st, var coder, src, off) == 0
+                        which = 2
+                    else
+                        which = 3
+            if not coder.ok
+                // cov: skip — the coder is never out of input here: a stream that runs out faults where the byte it needed was first missed, at a check before this one
+                return stopped(coder, st, d, out, XZ_SYMBOL_FAULT_RANGE)
+            st = next_state_rep(st)
+            d = reps_use(d, which)
+            let len = length_at(var probs, lit + XZ_REP_LEN_AT, pos, var coder, src, off)
+            if not coder.ok
+                return stopped(coder, st, d, out, XZ_SYMBOL_FAULT_RANGE)
+            if d.r0 >= out
+                // cov: skip — every remembered distance was checked where it was pushed and the output only grows
+                return stopped(coder, st, refused(d, d.r0), out, XZ_SYMBOL_FAULT_DISTANCE)
+            return copied(var dst, coder, st, d, out, d.r0, len)
 
 // What one symbol decode produced.
 //
@@ -546,4 +1259,18 @@ pub const XZ_SYMBOL_FAULT_BUFFER = 3
 //         None    => println("the symbol was well formed")
 // ```
 pub fn symbol_fault(s: XzSymbol, off: Int) -> ?XzFault []
-    todo("xz-nv.xzlzma.symbol_fault")
+    if s.fault == XZ_SYMBOL_FAULT_NONE
+        return None
+    if s.fault == XZ_SYMBOL_FAULT_DISTANCE
+        // The distance that was refused is at the front of the four:
+        // the symbol loop puts it there before it gives up.
+        return Some(xzerror.fault(XzDistanceTooFar(s.reps.r0, s.produced),
+                                  xzerror.here(-1, off, xzerror.XZ_LAYER_LZMA)))
+    if s.fault == XZ_SYMBOL_FAULT_RANGE
+        return Some(bad_range(off))
+    // A symbol that would have written past the end of the caller's
+    // buffer.  The one number the struct carries is the write point it
+    // reached, so the buffer it could not fit in is one byte past it at
+    // least — how much larger it needed to be is what the caller's own
+    // `LimitReached` or a larger buffer answers.
+    Some(buffer_too_small(s.produced + 1, s.produced))

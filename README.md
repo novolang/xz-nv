@@ -6,11 +6,6 @@ and implemented by [XZ Utils](https://tukaani.org/xz/). What it usually holds
 is LZMA2, a chunked form of the Lempel-Ziv-Markov chain algorithm. This package
 reads and writes both in novo-lang, and performs no input or output itself.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What xz is
 
 An `.xz` **file** is one or more *streams*, separated by zero padding to a
@@ -95,9 +90,6 @@ Build and test with:
 novo pkg build                  # type- and effect-check the package
 novo test --isolate tests/xzdec_tests.nv
 ```
-
-Today `novo test` fails on purpose: every assertion reaches
-`not implemented: xz-nv.<module>.<fn>`.
 
 ## What the package contains
 
@@ -282,36 +274,30 @@ reader with that source open recognises what they are.
 
 ## Test vectors
 
-XZ Utils' own `tests/files` directory is the oracle. It ships files built to
-exercise each of the four check types, each filter, an unsupported check type,
-a truncated stream, a stream with several blocks, a concatenated file, and a
-set of deliberately malformed files that a decoder must refuse. When the bodies
-land, every file in it is decoded or refused as its name says, as a generated
-run beside the four suites in `tests/`.
+XZ Utils is the oracle, and it is used in BOTH directions.
+
+On the way in, a corpus of files built by the real `xz` — 19 `.xz` files over
+all four check types, presets 0, 6 and 9, three filter chains (plain LZMA2,
+delta+LZMA2 and delta+x86+LZMA2) and streams of zero, one, two, six and
+fifteen blocks, plus 4 legacy `.lzma` files over their properties bytes — is
+decoded and compared byte for byte with what each was made from, and a
+flipped byte is refused at each of the 296 positions of the three smallest
+streams. That corpus cannot have been shaped to make this package's decoder
+look right, because this package did not write it. Concatenated streams and
+a check type this package does not implement are hand-built cases under
+`tests/`, since the corpus has neither.
+
+On the way out, every stream the encoder writes is handed to the real `xz -d`,
+which must produce the original bytes. That is the stronger of the two: a
+codec's own round trip can agree with itself while disagreeing with the format,
+and only a foreign decoder can tell the difference. One stream is an exception:
+the RISC-V branch converter has no verifier here, because this host's `xz`
+offers the other seven BCJ filters and not that one.
 
 Two check values have their own oracle and are asserted in
 `tests/xzcontainer_tests.nv`: CRC-64/XZ of the nine bytes `123456789` is
 `0x995DC9BBDF1939FA`, and the properties byte `0x5D` is `lc=3, lp=0, pb=2`,
 which is what every `xz` and every `lzma` writes unless told otherwise.
-
-## Implementation status
-
-Every function is a `todo()`. Every type is declared.
-
-| Module | Implemented |
-| --- | --- |
-| `xzdec` — `XzDecoder` and its twenty-two functions | no |
-| `xzenc` — `XzSettings`, `XzEncoder` and their thirteen functions | no |
-| `xzstream` — `XzStreamFlags`, `XzStreamHeader`, `XzStreamFooter` and their eight functions | no |
-| `xzblock` — `XzBlockHeader` and its nine functions | no |
-| `xzindex` — `XzIndexRecord`, `XzIndex` and their twelve functions | no |
-| `xzfilter` — `XzFilter` and its thirteen functions | no |
-| `xzlzma2` — `XzLzma2Chunk`, `XzLzma2State` and their eleven functions | no |
-| `xzlzma` — `XzLzmaProps`, `XzRepDistances`, `XzAloneHeader`, `XzSymbol` and their twenty-one functions | no |
-| `xzrange` — `XzRange`, `XzRangeStep` and their nine functions | no |
-| `xzcheck` — `XzCheck` and its thirteen functions | no |
-| `xzvli` — `XzVli` and its eight functions | no |
-| `xzerror` — `XzWhere`, `XzFaultKind`, `XzFault` and their eight functions | no |
 
 ## Licence
 

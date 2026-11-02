@@ -1,9 +1,6 @@
 // xzdec.nv — the load-bearing interface: an `.xz` decoder that
 // performs nothing.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // THE SHAPE, AND WHY IT IS THIS ONE
 //
 // `xz-nv` is a `core` package, so its budget is no effects at all and
@@ -56,10 +53,625 @@
 // caller who would rather not read data nothing verified.
 //
 // A FILE IS A SEQUENCE OF STREAMS, AND THIS DECODER READS ALL OF THEM.
+//
+// ONE BLOCK IS DECODED WHOLE, and that is the one thing here that is
+// not incremental.  `.xz` does not require a block header to declare
+// its compressed size — `xz` itself does not — so the end of a block is
+// found by decoding its LZMA2 chunks until the end marker, and the
+// dictionary the chunks write into is also the block's output.  A block
+// is therefore held in memory, up to its own dictionary size; the
+// limit a caller sets is what bounds it.
 
+use xzblock
+use xzcheck
 use xzerror
+use xzfilter
 use xzindex
+use xzlzma2
 use xzstream
+use xzvli
+
+// Reading the twelve-byte stream header of the stream in progress.
+const STAGE_STREAM_HEADER = 0
+// At the start of a block, or between streams.
+const STAGE_BLOCK = 1
+// Inside a block's body, past its header.
+const STAGE_BLOCK_BODY = 2
+// At the index that follows a stream's last block.
+const STAGE_INDEX = 3
+// At the twelve-byte stream footer.
+const STAGE_FOOTER = 4
+// Past a footer: stream padding, another stream, or the end of input.
+const STAGE_BETWEEN = 5
+
+// The probability array every LZMA2 chunk of every block shares: large
+// enough for the widest model the format allows.
+//
+// `lc + lp` may not exceed four, so the widest literal table a chunk
+// can ask for is `0x300 << 4` probabilities, and the rest of the model
+// — the length, distance and alignment coders — is a constant 14,134
+// entries at every legal `pb`.  That is 26,422 probabilities at two
+// bytes each, and it is allocated once per block rather than once per
+// chunk.
+const XZ_PROBS_BYTES = 52844
+
+// The first output size a block's dictionary starts at when its header
+// declares no uncompressed size: 64 KiB.
+//
+// A declared uncompressed size is used exactly, and a block that
+// declares none grows its dictionary by doubling — see
+// `restart_block`.  Without a floor the first doubling would be from
+// the dictionary window, which for a small file is a lot of allocation
+// for very little content.
+const XZ_DICT_BYTES_LEAST = 65536
+
+// The fault for a decoder that has already given up.
+fn failed(d: XzDecoder, f: XzFault) -> XzDecoder
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: d.limit,
+                strict_check: d.strict_check, strict_tail: d.strict_tail,
+                failure: Some(f), pending: d.pending, block: d.block,
+                lzma2: d.lzma2, index_started: d.index_started }
+
+// The same decoder somewhere else in the machine.
+fn moved_to(d: XzDecoder, stage: Int, layer: Int) -> XzDecoder
+    XzDecoder { layer: layer, stage: stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: d.limit,
+                strict_check: d.strict_check, strict_tail: d.strict_tail,
+                failure: d.failure, pending: d.pending, block: d.block,
+                lzma2: d.lzma2, index_started: d.index_started }
+
+// The same decoder with the first `n` bytes of its input spent.
+fn dropped(d: XzDecoder, n: Int) -> XzDecoder
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: d.limit,
+                strict_check: d.strict_check, strict_tail: d.strict_tail,
+                failure: d.failure,
+                pending: bytes.slice(d.pending, n, bytes.len(d.pending)),
+                block: d.block, lzma2: d.lzma2,
+                index_started: d.index_started }
+
+// The same decoder holding a different block body, or none.
+fn holding(d: XzDecoder, block: ?XzBlockHeader, lz: ?XzLzma2State) -> XzDecoder
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: d.limit,
+                strict_check: d.strict_check, strict_tail: d.strict_tail,
+                failure: d.failure, pending: d.pending, block: block,
+                lzma2: lz, index_started: d.index_started }
+
+// The same decoder having counted more content out, more of it
+// verified, and one more block behind it.
+//
+// The record is appended to a COPY of the list rather than through the
+// one the caller holds: the decoder is a value, and a `feed` that grew
+// the list its caller still holds would be a decoder that changed
+// under the caller's feet.
+fn advanced(d: XzDecoder, produced: Int, verified: Int, blocks: Int,
+            record: ?XzIndexRecord) -> XzDecoder
+    var records = list.clone(d.read_records)
+    match record
+        Some(r) =>
+            records = list.push(records, r)
+        // cov: skip — `advanced`'s one caller passes the record it just made
+        None    => ()
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks + blocks,
+                read_records: records, consumed: d.consumed,
+                produced: d.produced + produced,
+                verified: d.verified + verified, dict_limit: d.dict_limit,
+                limit: d.limit, strict_check: d.strict_check,
+                strict_tail: d.strict_tail, failure: d.failure,
+                pending: d.pending, block: d.block, lzma2: d.lzma2,
+                index_started: d.index_started }
+
+// The same decoder having taken in `n` more compressed bytes.
+fn took_in(d: XzDecoder, n: Int) -> XzDecoder
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed + n,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: d.limit,
+                strict_check: d.strict_check, strict_tail: d.strict_tail,
+                failure: d.failure, pending: d.pending, block: d.block,
+                lzma2: d.lzma2, index_started: d.index_started }
+
+// The same decoder having finished one more stream.
+//
+// The header STAYS: `streams` counts what has been read, and a caller
+// that has decoded a whole file still wants to know what check type
+// verified it — which is the question `check_type` exists to answer
+// and the one a `none`-checked file makes worth asking.  A second
+// stream's header replaces it, so the answer is always about the most
+// recent one.
+fn stream_done(d: XzDecoder) -> XzDecoder
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams + 1, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: d.limit,
+                strict_check: d.strict_check, strict_tail: d.strict_tail,
+                failure: d.failure, pending: d.pending, block: d.block,
+                lzma2: d.lzma2, index_started: d.index_started }
+
+// Every piece, in order, as one buffer.
+fn joined(parts: [Bytes]) -> Bytes
+    var out = bytes.zeros(0)
+    for p in parts
+        out = out + p
+    out
+
+// The fault for a caller's parameter this package refuses.
+fn bad_parameter(what: Str) -> XzFault
+    // cov: skip — its only two callers ask for a body with no decoder or a body with no header, and the stage machine enters neither
+    xzerror.fault(XzBadParameter(what),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_STREAM))
+
+// Where a fault found while reading the stream header or footer is.
+fn at_stream(off: Int) -> XzWhere
+    xzerror.here(-1, off, xzerror.XZ_LAYER_STREAM)
+
+// The LZMA2 filter of a chain's one compression filter.
+//
+// `xzfilter.check_chain` has already answered that the chain holds
+// exactly one and that it is last, so this is the last element and
+// nothing else has to be looked at.
+fn compression_filter(h: XzBlockHeader) -> XzFilter
+    list.get(h.filters, list.len(h.filters) - 1)
+
+// How many bytes a block of this shape pads with, before its check.
+//
+// The rule is the format's: the padding brings the UNPADDED size —
+// header plus data plus check — to a multiple of four, which is why
+// the check's own length is part of the sum even though the check
+// itself comes after the padding.
+fn block_padding(header_bytes: Int, data_bytes: Int, check_bytes: Int) -> Int
+    xzvli.padding_after(header_bytes + data_bytes + check_bytes)
+
+// How many bytes an index with these records occupies, padding and CRC
+// included.
+//
+// Computed from what the decoder read rather than from what the file
+// says, because it is the number that decides whether the index has
+// arrived yet: everything else about the index can be checked once it
+// is all there, but nothing can be checked until it is.
+fn index_bytes_for(records: [XzIndexRecord]) -> Int
+    var body = 1 + vli_len(list.len(records))
+    for r in records
+        body = body + vli_len(r.unpadded) + vli_len(r.uncompressed)
+    xzvli.round_up(body) + 4
+
+// How many bytes a value takes as a variable-length integer.
+fn vli_len(n: Int) -> Int
+    match xzvli.encoded_bytes(n)
+        Ok(w)  => w
+        // cov: skip — every byte count has a VLI, so `encoded_bytes` cannot refuse one
+        Err(_) => 1
+
+// One step of the machine, whatever stage it is in.
+//
+// Answers the decoder after it, the content the step produced, and
+// whether the step got anywhere.  A step that answers false has not
+// changed the machine and is waiting for more input; only `feed` and
+// `finish` decide what that means.
+fn step(d: XzDecoder) -> (XzDecoder, Bytes, Bool) []
+    if d.stage == STAGE_STREAM_HEADER
+        return stream_header_step(d)
+    if d.stage == STAGE_BLOCK
+        return block_header_step(d)
+    if d.stage == STAGE_BLOCK_BODY
+        return block_body_step(d)
+    if d.stage == STAGE_INDEX
+        return index_step(d)
+    if d.stage == STAGE_FOOTER
+        return footer_step(d)
+    between_step(d)
+
+// Every step the machine can take with the bytes it already holds, and
+// the content they produced.
+//
+// The loop is bounded because a step that answers `true` either spends
+// input or moves the machine to a stage that looks at it.  Two steps
+// answer `true` without spending a byte — the index indicator and the
+// header of a following stream — and each happens once per transition
+// into a stage, so neither can repeat.  A step that answers `false` is
+// waiting for input, and a failed one is finished with.
+fn drain(d: XzDecoder) -> (XzDecoder, Bytes) []
+    var cur = d
+    var parts: [Bytes] = []
+    var going = true
+    while going
+        if let Some(_) = cur.failure
+            going = false
+        else
+            let (next, out, moved_on) = step(cur)
+            cur = next
+            if bytes.len(out) > 0
+                list.push(parts, bytes.clone(out))
+            if not moved_on
+                going = false
+    (cur, joined(parts))
+
+// The twelve bytes a stream starts with.
+fn stream_header_step(d: XzDecoder) -> (XzDecoder, Bytes, Bool) []
+    if bytes.len(d.pending) < xzstream.XZ_HEADER_BYTES
+        return (d, bytes.zeros(0), false)
+    let head = bytes.slice(d.pending, 0, xzstream.XZ_HEADER_BYTES)
+    match xzstream.read_header(head)
+        Err(f) => (failed(d, f), bytes.zeros(0), false)
+        Ok(h)  =>
+            // A new stream's blocks are its own: the records the last
+            // stream's index was checked against are finished with.
+            let fresh = XzDecoder { layer: d.layer, stage: d.stage,
+                                    stream: Some(h), streams: d.streams,
+                                    blocks: d.blocks,
+                                    read_records: [], consumed: d.consumed,
+                                    produced: d.produced,
+                                    verified: d.verified,
+                                    dict_limit: d.dict_limit,
+                                    limit: d.limit,
+                                    strict_check: d.strict_check,
+                                    strict_tail: d.strict_tail,
+                                    failure: d.failure, pending: d.pending,
+                                    block: None, lzma2: None,
+                                    index_started: false }
+            (dropped(moved_to(fresh, STAGE_BLOCK, xzerror.XZ_LAYER_BLOCK),
+                     xzstream.XZ_HEADER_BYTES),
+                     bytes.zeros(0), true)
+
+// The block header at the front of the input, or the index indicator
+// that says there are no more blocks.
+fn block_header_step(d: XzDecoder) -> (XzDecoder, Bytes, Bool) []
+    let first = bytes.byte_at(d.pending, 0) ?? -1
+    if first < 0
+        return (d, bytes.zeros(0), false)
+    if first == xzblock.XZ_INDEX_INDICATOR
+        // The transition costs no bytes: the very next step reads the
+        // index, and it is the one that either gets somewhere or
+        // reports that the input has run out.
+        return (moved_to(d, STAGE_INDEX, xzerror.XZ_LAYER_INDEX), bytes.zeros(0), true)
+    let size = xzblock.header_size_from(first)
+    if bytes.len(d.pending) < size
+        return (d, bytes.zeros(0), false)
+    match xzblock.read_header(d.pending, 0)
+        Err(f) => (failed(d, f), bytes.zeros(0), false)
+        Ok(h)  => open_block(dropped(d, size), h)
+
+// The most one input byte can expand to: an LZMA2 chunk carries at most
+// 2 MiB of output behind a header of at least three bytes.
+const XZ_EXPANSION_MAX = 699051
+
+// The larger of two Ints.
+fn max_int(a: Int, b: Int) -> Int
+    if a > b
+        a
+    else
+        b
+
+// The buffer to reserve for a block whose header declares `declared`
+// output bytes, given the `floor` its dictionary already needs.
+//
+// A header is untrusted and is read before any byte of the block, so a
+// declared size is honoured up front only as far as the dictionary
+// limit allows.  A block that outgrows the reservation is decoded again
+// into a doubled buffer by `restart_block`, which costs a little time
+// and never more memory than the bytes actually produced.
+fn declared_reservation(floor: Int, declared: Int, dict_limit: Int) -> Int
+    if declared <= floor
+        return floor
+    if dict_limit >= 0 and declared > dict_limit
+        return max_int(floor, dict_limit)
+    declared
+
+// A reservation held to what is left of the caller's output limit.  The
+// buffer is the block's whole output, so it never needs more.
+fn within_output_limit(want: Int, remaining: Int) -> Int
+    if remaining < 1
+        return 1
+    if want > remaining
+        return remaining
+    want
+
+// Start decoding the body of a block whose header has been read and
+// dropped.
+fn open_block(d: XzDecoder, h: XzBlockHeader) -> (XzDecoder, Bytes, Bool) []
+    let f = compression_filter(h)
+    let byte = bytes.byte_at(f.props, 0) ?? -1
+    let window = match xzfilter.lzma2_dictionary_bytes(byte)
+        Ok(n)  => n
+        // cov: skip — the chain check refused a bad properties byte before this reads it
+        Err(_) => 0
+    if window <= 0
+        // cov: skip — `lzma2_dictionary_bytes` refuses the byte the chain check already refused
+        return (failed(d, xzerror.fault(XzBadFilterProperties(f.id),
+                                        xzerror.here(-1, -1, xzerror.XZ_LAYER_FILTER))),
+                bytes.zeros(0), false)
+    // THE LIMIT IS A POLICY AND NOTHING ABOUT THE FILE: a block asking
+    // for 4 GiB from a caller who budgeted 64 MiB is a good block
+    // meeting a good bound, which is why it is `is_limit` and not
+    // `is_corrupt`.
+    if d.dict_limit >= 0 and window > d.dict_limit
+        return (failed(d, xzerror.fault(XzLimitReached(window, d.dict_limit),
+                                        xzerror.here(-1, 0, xzerror.XZ_LAYER_BLOCK))),
+                bytes.zeros(0), false)
+    // A declared uncompressed size is the block's exact output length,
+    // so it is the whole answer and no growth is needed.  Nothing else
+    // bounds it, so the dictionary window is the start and `restart_block`
+    // is what carries on from there.
+    var want = window
+    if want < XZ_DICT_BYTES_LEAST
+        want = XZ_DICT_BYTES_LEAST
+    if xzblock.has_uncompressed_size(h)
+        want = declared_reservation(want, h.uncompressed_size, d.dict_limit)
+    if d.limit >= 0
+        want = within_output_limit(want, d.limit - d.produced)
+    match xzlzma2.decoder(bytes.zeros(want), bytes.zeros(XZ_PROBS_BYTES))
+        // cov: skip — `want` is at least one byte and the probability buffer is the format's own count
+        Err(fault) => (failed(d, fault), bytes.zeros(0), false)
+        Ok(lz)     =>
+            let next = moved_to(holding(dropped(d, 0), Some(h), Some(lz)),
+                                STAGE_BLOCK_BODY, xzerror.XZ_LAYER_BLOCK)
+            (next, bytes.zeros(0), true)
+
+// The next LZMA2 chunk of the block in progress, or its end marker.
+fn block_body_step(d: XzDecoder) -> (XzDecoder, Bytes, Bool) []
+    match d.lzma2
+        // cov: skip — a block body is only entered with a decoder
+        None     => (failed(d, bad_parameter("xzdec: a block body with no decoder")),
+                 bytes.zeros(0), false)
+        Some(lz) =>
+            let at = xzlzma2.consumed_of(lz)
+            if at >= bytes.len(d.pending)
+                return (d, bytes.zeros(0), false)
+            if (bytes.byte_at(d.pending, at) ?? -1) == xzlzma2.XZ_LZMA2_END
+                return close_block(d, lz, at)
+            match xzlzma2.decode_chunk(lz, d.pending, at)
+                Ok(next) =>
+                    // The output bound is checked per chunk, so a file
+                    // that declares no size cannot outrun it: waiting
+                    // for the block's end would be waiting for the
+                    // whole allocation first.
+                    let total = d.produced + xzlzma2.produced_of(next)
+                    if d.limit >= 0 and total > d.limit
+                        (failed(d, xzerror.fault(XzLimitReached(total, d.limit),
+                                                 xzerror.here(-1, at,
+                                                              xzerror.XZ_LAYER_BLOCK))),
+                         bytes.zeros(0), false)
+                    else
+                        (holding_copied(d, next), bytes.zeros(0), true)
+                Err(f)   =>
+                    // A chunk that is not all there yet is not a
+                    // failure: the next `feed` brings the rest.
+                    if xzerror.is_incomplete(f.kind)
+                        (d, bytes.zeros(0), false)
+                    else
+                        if xzerror.is_limit(f.kind)
+                            restart_block(d, lz, f)
+                        else
+                            (failed(d, f), bytes.zeros(0), false)
+
+// The same decoder carrying a different LZMA2 state.
+fn holding_copied(d: XzDecoder, lz: XzLzma2State) -> XzDecoder
+    holding(d, d.block, Some(lz))
+
+// Grow a block's dictionary and decode it again from its first chunk.
+//
+// THE DICTIONARY IS THE OUTPUT BUFFER, and a block that declares no
+// uncompressed size may produce more than its window holds.  Doubling
+// and starting the block over is exact — the input is all still there,
+// and a linear buffer holds what a circular window would — and the
+// restarts are geometric, so a block that overflows k times costs less
+// than twice one pass.  The fault is answered again, unchanged, when
+// growing cannot be what is wrong.
+fn restart_block(d: XzDecoder, lz: XzLzma2State, f: XzFault) -> (XzDecoder, Bytes, Bool) []
+    let had = bytes.len(lz.dict)
+    // A dictionary of one byte cannot be doubled usefully and the
+    // 4 GiB the format's largest window can ask for is the ceiling, so
+    // a fault above it is about something other than the dictionary.
+    if had >= 2147483648
+        // cov: skip — a dictionary of 2 GiB is never allocated by this package
+        return (failed(d, f), bytes.zeros(0), false)
+    var want = had * 2
+    if d.limit >= 0 and want > d.limit
+        want = d.limit
+    if want <= had
+        return (failed(d, f), bytes.zeros(0), false)
+    match xzlzma2.decoder(bytes.zeros(want), bytes.zeros(XZ_PROBS_BYTES))
+        // cov: skip — `want` was doubled above the current dictionary, so the decoder cannot refuse it
+        Err(fault) => (failed(d, fault), bytes.zeros(0), false)
+        Ok(fresh)  => (moved_to(holding(d, d.block, Some(fresh)),
+                                STAGE_BLOCK_BODY, xzerror.XZ_LAYER_BLOCK),
+                       bytes.zeros(0), true)
+
+// The end marker of the block's last chunk: everything after it, which
+// is the padding and the check, and then the block's own accounting.
+fn close_block(d: XzDecoder, lz: XzLzma2State, at: Int) -> (XzDecoder, Bytes, Bool) []
+    let Some(h) = d.block else
+        // cov: skip — a body is only left with its own header in hand
+        return (failed(d, bad_parameter("xzdec: a block body with no header")),
+                bytes.zeros(0), false)
+    let check = check_of(d)
+    let check_bytes = match xzcheck.size_of(check)
+        Ok(n)  => n
+        // cov: skip — `check_of` names a check the stream header already accepted
+        Err(_) => 0
+    let hsize = match xzblock.header_bytes(h)
+        Ok(b)  => bytes.len(b)
+        // cov: skip — `read_header` refuses a zero size and applies the same chain check
+        Err(f) => 0
+    let data_bytes = at + 1
+    let pad = block_padding(hsize, data_bytes, check_bytes)
+    let need = data_bytes + pad + check_bytes
+    if bytes.len(d.pending) < need
+        return (d, bytes.zeros(0), false)
+    if not xzvli.padding_is_clean(d.pending, data_bytes, pad)
+        return (failed(d, xzerror.fault(XzBadBlockHeader(data_bytes),
+                                        xzerror.here(-1, data_bytes,
+                                                     xzerror.XZ_LAYER_BLOCK))),
+                bytes.zeros(0), false)
+    let produced = xzlzma2.produced_of(lz)
+    // THE CHAIN RUNS BACKWARDS ON THE WAY IN: the block's content is
+    // what comes out of the LAST filter and then through each of the
+    // others in reverse, which is why the converters are undone here
+    // and not chunk by chunk.
+    var content = bytes.clone(lz.dict)
+    var i = list.len(h.filters) - 2
+    while i >= 0
+        match xzfilter.decode_in_place(list.get(h.filters, i), var content, 0, produced)
+            Err(f) =>
+                // cov: skip — a converter chain `read_header` accepted cannot fail to apply
+                return (failed(d, f), bytes.zeros(0), false)
+            Ok(b)  =>
+                content = bytes.clone(b)
+        i = i - 1
+    match xzblock.check_sizes(h, data_bytes, produced)
+        Err(f) =>
+            return (failed(d, f), bytes.zeros(0), false)
+        Ok(_)  => ()
+    // An unsupported check has a size the format fixes, so the bytes
+    // are stepped over whether or not anything verified them; only
+    // `with_strict_check` makes that a refusal, and it did so when the
+    // stream header was read.
+    var good = check == xzcheck.XZ_CHECK_NONE
+    if check != xzcheck.XZ_CHECK_NONE and xzcheck.is_supported(check)
+        let stated = bytes.slice(d.pending, data_bytes + pad, need)
+        match xzcheck.start(check)
+            Err(f) =>
+                // cov: skip — the check came from a stream header that already accepted it
+                return (failed(d, f), bytes.zeros(0), false)
+            Ok(s)  =>
+                // The check is built over the block's CONTENT — the
+                // bytes that come out, not the bytes that went in —
+                // which is why the filters above have already run and
+                // `content` is what is fed here.
+                let fed = xzcheck.update(s, content, 0, produced)
+                if not xzcheck.matches(fed, stated)
+                    return (failed(d, xzerror.fault(XzCheckMismatch(check),
+                                                    xzerror.here(-1, data_bytes,
+                                                                 xzerror.XZ_LAYER_CHECK))),
+                            bytes.zeros(0), false)
+                good = true
+    let record = xzindex.record(hsize + data_bytes + check_bytes, produced)
+    // A `none` check verified nothing, so a stream that declares one
+    // leaves `verified_out` at zero however much it produced — which is
+    // the answer that makes that counter worth having.
+    var verified = 0
+    if good and check != xzcheck.XZ_CHECK_NONE
+        verified = produced
+    let settled = advanced(moved_to(holding(dropped(d, need), None, None),
+                                    STAGE_BLOCK, xzerror.XZ_LAYER_BLOCK),
+                           produced, verified, 1, Some(record))
+    (settled, bytes.slice(content, 0, produced), true)
+
+// The index that follows a stream's last block.
+fn index_step(d: XzDecoder) -> (XzDecoder, Bytes, Bool) []
+    let want = index_bytes_for(d.read_records)
+    if bytes.len(d.pending) < want
+        return (d, bytes.zeros(0), false)
+    match xzindex.read(d.pending, 0)
+        Err(f) => (failed(d, f), bytes.zeros(0), false)
+        Ok(i)  =>
+            match xzindex.agrees_with(i, d.read_records)
+                Err(f) => (failed(d, f), bytes.zeros(0), false)
+                Ok(_)  =>
+                    let next = XzDecoder { layer: d.layer, stage: STAGE_FOOTER,
+                                           stream: d.stream,
+                                           streams: d.streams,
+                                           blocks: d.blocks,
+                                           read_records: d.read_records,
+                                           consumed: d.consumed,
+                                           produced: d.produced,
+                                           verified: d.verified,
+                                           dict_limit: d.dict_limit,
+                                           limit: d.limit,
+                                           strict_check: d.strict_check,
+                                           strict_tail: d.strict_tail,
+                                           failure: d.failure,
+                                           pending: d.pending, block: None,
+                                           lzma2: None,
+                                           index_started: true }
+                    (dropped(next, want), bytes.zeros(0), true)
+
+// The twelve bytes a stream ends with.
+fn footer_step(d: XzDecoder) -> (XzDecoder, Bytes, Bool) []
+    if bytes.len(d.pending) < xzstream.XZ_FOOTER_BYTES
+        return (d, bytes.zeros(0), false)
+    let tail = bytes.slice(d.pending, 0, xzstream.XZ_FOOTER_BYTES)
+    match xzstream.read_footer(tail)
+        Err(f) => (failed(d, f), bytes.zeros(0), false)
+        Ok(f)  =>
+            match d.stream
+                // cov: skip — a footer is only read with a stream header in hand
+                None    => (failed(d, xzerror.fault(XzBadFooterMagic,
+                                                 at_stream(0))),
+                         bytes.zeros(0), false)
+                Some(h) =>
+                    if not xzstream.flags_agree(h.flags, f.flags)
+                        return (failed(d, xzerror.fault(XzFlagsMismatch,
+                                                        at_stream(10))),
+                                bytes.zeros(0), false)
+                    // The footer's backward size must name the index
+                    // that was just read, which is the one field that
+                    // makes seeking into a stream possible.
+                    let here = index_bytes_for(d.read_records)
+                    if f.index_bytes != here
+                        return (failed(d, xzerror.fault(XzBadBackwardSize(f.index_bytes),
+                                                        at_stream(4))),
+                                bytes.zeros(0), false)
+                    let done = stream_done(moved_to(dropped(d, xzstream.XZ_FOOTER_BYTES),
+                                                    STAGE_BETWEEN,
+                                                    xzerror.XZ_LAYER_STREAM))
+                    (done, bytes.zeros(0), true)
+
+// Past a footer: stream padding in four-byte groups, another stream, or
+// the end of the input.
+fn between_step(d: XzDecoder) -> (XzDecoder, Bytes, Bool) []
+    if bytes.len(d.pending) == 0
+        return (d, bytes.zeros(0), false)
+    let first = bytes.byte_at(d.pending, 0) ?? -1
+    if first == 0
+        // Stream padding is whole four-byte groups of zeroes, so fewer
+        // than four left is either the end of the input or bytes that
+        // are not padding — and only a whole group may be stepped
+        // over, or a file cut mid-group would look like one that was
+        // padded correctly.
+        if bytes.len(d.pending) < 4
+            return (d, bytes.zeros(0), false)
+        var i = 0
+        while i < 4
+            if (bytes.byte_at(d.pending, i) ?? -1) != 0
+                return (trailing_bytes(d, 0), bytes.zeros(0), false)
+            i = i + 1
+        return (dropped(d, 4), bytes.zeros(0), true)
+    if d.strict_tail and first != 0xFD
+        return (trailing_bytes(d, 0), bytes.zeros(0), false)
+    // Another stream, or bytes that are not one — and the stream
+    // header's own magic check is what says which.  The transition
+    // costs no bytes, so `feed`'s loop moves on to the header itself.
+    (moved_to(d, STAGE_STREAM_HEADER, xzerror.XZ_LAYER_STREAM), bytes.zeros(0), true)
+
+// Refuse bytes that are neither padding nor another stream.
+fn trailing_bytes(d: XzDecoder, at: Int) -> XzDecoder
+    failed(d, xzerror.fault(XzTrailingBytes(d.produced + at),
+                            at_stream(at)))
+
+// The check type the stream in progress declares.
+fn check_of(d: XzDecoder) -> Int
+    match d.stream
+        Some(h) => xzstream.check_of(h)
+        // cov: skip — `check_of` is only asked inside a block, whose stream has a header
+        None    => xzcheck.XZ_CHECK_NONE
 
 // A decoder between chunks.
 //
@@ -80,6 +692,11 @@ pub struct XzDecoder
     // `Int` rather than an enum so the whole decoder stays cheap to
     // copy.
     layer: Int
+    // Which of the six stages of a stream the machine is in.  Finer
+    // than `layer` and private: the four states between a stream's
+    // first byte and its last are all one layer, and telling a block
+    // header from a footer is the whole of what the machine does.
+    stage: Int
     // The header of the stream being read, or absent before the first
     // twelve bytes have arrived.
     stream: ?XzStreamHeader
@@ -108,6 +725,23 @@ pub struct XzDecoder
     strict_tail: Bool
     // The sticky failure, or absent.
     failure: ?XzFault
+    // Compressed bytes that have been fed and not consumed yet.  Byte
+    // zero of this is the next byte the machine will look at, so a
+    // chunk boundary anywhere — inside a header, a size field or a
+    // block's last chunk — is carried rather than discarded.
+    pending: Bytes
+    // The header of the block being decoded, or absent between blocks.
+    block: ?XzBlockHeader
+    // The LZMA2 chunk decoder of the block in progress, or absent
+    // between blocks.  Its dictionary is also the block's output, and
+    // `consumed_of` on it is how far into the block's body the
+    // machine has read.
+    lzma2: ?XzLzma2State
+    // Whether the index indicator has been passed.  Kept only so that
+    // `finish` can tell a file that stopped between blocks from one
+    // that stopped in the middle of its table of contents, which are
+    // a damaged file and a short one respectively.
+    index_started: Bool
 
 // The dictionary limit a fresh decoder starts with: 67,108,864 bytes.
 //
@@ -125,7 +759,13 @@ pub const XZ_DICT_LIMIT_DEFAULT = 67108864
 //     println("${xzdec.blocks_done(xzdec.decoder())}")
 // ```
 pub fn decoder() -> XzDecoder []
-    todo("xz-nv.xzdec.decoder")
+    XzDecoder { layer: xzerror.XZ_LAYER_STREAM, stage: STAGE_STREAM_HEADER,
+                stream: None, streams: 0, blocks: 0, read_records: [],
+                consumed: 0, produced: 0, verified: 0,
+                dict_limit: XZ_DICT_LIMIT_DEFAULT, limit: -1,
+                strict_check: false, strict_tail: false, failure: None,
+                pending: bytes.zeros(0), block: None, lzma2: None,
+                index_started: false }
 
 // A decoder that refuses a block asking for a dictionary larger than
 // `cap` bytes.
@@ -142,7 +782,14 @@ pub fn decoder() -> XzDecoder []
 //     println("${xzdec.dict_limit_of(xzdec.with_dict_limit(xzdec.decoder(), 8388608))}")
 // ```
 pub fn with_dict_limit(d: XzDecoder, cap: Int) -> XzDecoder []
-    todo("xz-nv.xzdec.with_dict_limit")
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: cap, limit: d.limit,
+                strict_check: d.strict_check, strict_tail: d.strict_tail,
+                failure: d.failure, pending: d.pending, block: d.block,
+                lzma2: d.lzma2, index_started: d.index_started }
 
 // The dictionary limit in force, in bytes.
 //
@@ -153,7 +800,7 @@ pub fn with_dict_limit(d: XzDecoder, cap: Int) -> XzDecoder []
 //     println("${xzdec.dict_limit_of(xzdec.decoder())}")
 // ```
 pub fn dict_limit_of(d: XzDecoder) -> Int []
-    todo("xz-nv.xzdec.dict_limit_of")
+    d.dict_limit
 
 // A decoder that refuses to produce more than `cap` bytes of content.
 //
@@ -168,7 +815,14 @@ pub fn dict_limit_of(d: XzDecoder) -> Int []
 //     println("${xzdec.limit_of(xzdec.with_limit(xzdec.decoder(), 1048576))}")
 // ```
 pub fn with_limit(d: XzDecoder, cap: Int) -> XzDecoder []
-    todo("xz-nv.xzdec.with_limit")
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: cap,
+                strict_check: d.strict_check, strict_tail: d.strict_tail,
+                failure: d.failure, pending: d.pending, block: d.block,
+                lzma2: d.lzma2, index_started: d.index_started }
 
 // The output bound in force, or `-1`.
 //
@@ -179,7 +833,7 @@ pub fn with_limit(d: XzDecoder, cap: Int) -> XzDecoder []
 //     println("${xzdec.limit_of(xzdec.decoder())}")
 // ```
 pub fn limit_of(d: XzDecoder) -> Int []
-    todo("xz-nv.xzdec.limit_of")
+    d.limit
 
 // A decoder that refuses a stream whose check type it cannot verify.
 //
@@ -196,7 +850,14 @@ pub fn limit_of(d: XzDecoder) -> Int []
 //     println("${xzdec.is_strict_check(xzdec.with_strict_check(xzdec.decoder()))}")
 // ```
 pub fn with_strict_check(d: XzDecoder) -> XzDecoder []
-    todo("xz-nv.xzdec.with_strict_check")
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: d.limit,
+                strict_check: true, strict_tail: d.strict_tail,
+                failure: d.failure, pending: d.pending, block: d.block,
+                lzma2: d.lzma2, index_started: d.index_started }
 
 // Whether `with_strict_check` was asked for.
 //
@@ -207,7 +868,7 @@ pub fn with_strict_check(d: XzDecoder) -> XzDecoder []
 //     println("${xzdec.is_strict_check(xzdec.decoder())}")
 // ```
 pub fn is_strict_check(d: XzDecoder) -> Bool []
-    todo("xz-nv.xzdec.is_strict_check")
+    d.strict_check
 
 // A decoder that refuses bytes after the last stream footer.
 //
@@ -223,7 +884,14 @@ pub fn is_strict_check(d: XzDecoder) -> Bool []
 //     println("${xzdec.is_strict_tail(xzdec.with_strict_tail(xzdec.decoder()))}")
 // ```
 pub fn with_strict_tail(d: XzDecoder) -> XzDecoder []
-    todo("xz-nv.xzdec.with_strict_tail")
+    XzDecoder { layer: d.layer, stage: d.stage, stream: d.stream,
+                streams: d.streams, blocks: d.blocks,
+                read_records: d.read_records, consumed: d.consumed,
+                produced: d.produced, verified: d.verified,
+                dict_limit: d.dict_limit, limit: d.limit,
+                strict_check: d.strict_check, strict_tail: true,
+                failure: d.failure, pending: d.pending, block: d.block,
+                lzma2: d.lzma2, index_started: d.index_started }
 
 // Whether `with_strict_tail` was asked for.
 //
@@ -234,7 +902,7 @@ pub fn with_strict_tail(d: XzDecoder) -> XzDecoder []
 //     println("${xzdec.is_strict_tail(xzdec.decoder())}")
 // ```
 pub fn is_strict_tail(d: XzDecoder) -> Bool []
-    todo("xz-nv.xzdec.is_strict_tail")
+    d.strict_tail
 
 // Hand the decoder the next chunk, and take whatever content it
 // produced.
@@ -252,7 +920,30 @@ pub fn is_strict_tail(d: XzDecoder) -> Bool []
 //     println("${bytes.len(out)} ${xzdec.total_in(d)}")
 // ```
 pub fn feed(d: XzDecoder, chunk: Bytes) -> (XzDecoder, Bytes) []
-    todo("xz-nv.xzdec.feed")
+    // A decoder that has already failed stays failed: the reason is
+    // the answer, and a byte fed after it is a byte nobody should have
+    // handed over.  It is still counted, because `total_in` answers
+    // how much the caller has handed over, and a caller watching it
+    // while a decode fails must not see the number stop.
+    if let Some(_) = d.failure
+        return (took_in(d, bytes.len(chunk)), bytes.zeros(0))
+    let stacked = XzDecoder { layer: d.layer, stage: d.stage,
+                              stream: d.stream, streams: d.streams,
+                              blocks: d.blocks, read_records: d.read_records,
+                              consumed: d.consumed, produced: d.produced,
+                              verified: d.verified, dict_limit: d.dict_limit,
+                              limit: d.limit, strict_check: d.strict_check,
+                              strict_tail: d.strict_tail, failure: d.failure,
+                              pending: d.pending + chunk, block: d.block,
+                              lzma2: d.lzma2,
+                              index_started: d.index_started }
+    // THE COUNT IS OF BYTES HANDED OVER, NOT BYTES LOOKED AT YET.  A
+    // chunk of six that completed a twelve-byte header half of which
+    // was fed earlier has all six of itself in `total_in`, however much
+    // of the header the machine went on to read — which is what makes
+    // the counter comparable with the file's own size at any instant
+    // rather than only between chunk boundaries.
+    drain(took_in(stacked, bytes.len(chunk)))
 
 // End of stream: the last content, or the reason there is none.
 //
@@ -270,7 +961,50 @@ pub fn feed(d: XzDecoder, chunk: Bytes) -> (XzDecoder, Bytes) []
 //         Err(e) => println(e.message())
 // ```
 pub fn finish(d: XzDecoder) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzdec.finish")
+    let (next, out) = drain(d)
+    match next.failure
+        Some(f) => Err(f)
+        None    =>
+            if next.stage == STAGE_BETWEEN and next.streams > 0
+                // A footer has been checked and everything fed has
+                // been consumed, so the file is over as far as this
+                // decoder can tell.  What can still be outstanding is
+                // fewer than four zeroes — a stream-padding group that
+                // was cut — and only `with_strict_tail` makes that an
+                // error rather than the end of the file.
+                if next.strict_tail and left_over(next) > 0
+                    return Err(xzerror.fault(XzTrailingBytes(next.produced + 1),
+                                             at_stream(bytes.len(next.pending) - 1)))
+                Ok(out)
+            else
+                if next.index_started
+                    Err(xzerror.fault(
+                        XzIndexMismatch("the stream ended inside its index"),
+                        xzerror.here(-1, bytes.len(next.pending),
+                                     xzerror.XZ_LAYER_INDEX)))
+                else
+                    Err(xzerror.fault(XzTruncated(wanted_more(next)),
+                                      xzerror.here(-1, bytes.len(next.pending),
+                                                   next.layer)))
+
+// How many bytes of the input the decoder has not looked at.
+fn left_over(d: XzDecoder) -> Int
+    bytes.len(d.pending)
+
+// How many more bytes the machine needs before it can take a step.
+fn wanted_more(d: XzDecoder) -> Int
+    if d.stage == STAGE_STREAM_HEADER
+        // The twelve the header needs, less what has arrived.
+        return 12 - bytes.len(d.pending)
+    if d.stage == STAGE_FOOTER
+        // cov: skip — the one transition into STAGE_FOOTER sets index_started, so `finish` answers the index fault first
+        return 12 - bytes.len(d.pending)
+    if d.stage == STAGE_BLOCK_BODY
+        // A block body is a sequence of chunks, so the next byte is
+        // the whole of what is missing — or the end marker is already
+        // here and the fault is somewhere else in the block.
+        return 1
+    -1
 
 // The sticky failure, or `None`.
 //
@@ -283,7 +1017,7 @@ pub fn finish(d: XzDecoder) -> Result<Bytes, XzFault> []
 //         None    => println("no failure yet")
 // ```
 pub fn error(d: XzDecoder) -> ?XzFault []
-    todo("xz-nv.xzdec.error")
+    d.failure
 
 // Compressed bytes consumed so far.
 //
@@ -294,7 +1028,7 @@ pub fn error(d: XzDecoder) -> ?XzFault []
 //     println("${xzdec.total_in(xzdec.decoder())}")
 // ```
 pub fn total_in(d: XzDecoder) -> Int []
-    todo("xz-nv.xzdec.total_in")
+    d.consumed
 
 // Content bytes produced so far.
 //
@@ -305,7 +1039,7 @@ pub fn total_in(d: XzDecoder) -> Int []
 //     println("${xzdec.total_out(xzdec.decoder())}")
 // ```
 pub fn total_out(d: XzDecoder) -> Int []
-    todo("xz-nv.xzdec.total_out")
+    d.produced
 
 // Content bytes whose block check has been VERIFIED.
 //
@@ -322,7 +1056,7 @@ pub fn total_out(d: XzDecoder) -> Int []
 //     println("${xzdec.verified_out(xzdec.decoder())}")
 // ```
 pub fn verified_out(d: XzDecoder) -> Int []
-    todo("xz-nv.xzdec.verified_out")
+    d.verified
 
 // How many blocks have been finished, across every stream.
 //
@@ -333,7 +1067,7 @@ pub fn verified_out(d: XzDecoder) -> Int []
 //     println("${xzdec.blocks_done(xzdec.decoder())}")
 // ```
 pub fn blocks_done(d: XzDecoder) -> Int []
-    todo("xz-nv.xzdec.blocks_done")
+    d.blocks
 
 // How many streams have been finished.
 //
@@ -348,13 +1082,15 @@ pub fn blocks_done(d: XzDecoder) -> Int []
 //     println("${xzdec.streams_done(xzdec.decoder())}")
 // ```
 pub fn streams_done(d: XzDecoder) -> Int []
-    todo("xz-nv.xzdec.streams_done")
+    d.streams
 
-// The check type the stream in progress declares, or `-1`.
+// The check type the most recent stream declares, or `-1`.
 //
 // Published because `none` is a legal check type and a caller that
 // cares whether anything verified its data should be able to see that
-// nothing did.
+// nothing did.  It outlives the stream's footer, so the question can
+// still be asked of a decoder that has finished its file — and the
+// answer is then what verified the file.
 //
 // ```novo
 // use xzdec
@@ -363,9 +1099,15 @@ pub fn streams_done(d: XzDecoder) -> Int []
 //     println("${xzdec.check_type(xzdec.decoder())}")
 // ```
 pub fn check_type(d: XzDecoder) -> Int []
-    todo("xz-nv.xzdec.check_type")
+    match d.stream
+        Some(h) => xzstream.check_of(h)
+        None    => -1
 
-// The header of the stream being read, or `None`.
+// The header of the most recent stream, or `None`.
+//
+// Absent until twelve bytes have been read.  Like `check_type` it
+// survives the stream's footer, so a caller that has decoded a whole
+// file can still read back the flags it declared.
 //
 // ```novo
 // use xzdec
@@ -376,7 +1118,7 @@ pub fn check_type(d: XzDecoder) -> Int []
 //         None    => println("no header yet")
 // ```
 pub fn stream_header(d: XzDecoder) -> ?XzStreamHeader []
-    todo("xz-nv.xzdec.stream_header")
+    d.stream
 
 // Decompress a whole `.xz` held in memory.
 //
@@ -393,7 +1135,10 @@ pub fn stream_header(d: XzDecoder) -> ?XzStreamHeader []
 //         Err(e) => println(e.message())
 // ```
 pub fn decompress(data: Bytes) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzdec.decompress")
+    let (d, out) = feed(decoder(), data)
+    match finish(d)
+        Err(f)   => Err(f)
+        Ok(tail) => Ok(out + tail)
 
 // Decompress a whole `.xz`, with both bounds.
 //
@@ -410,7 +1155,11 @@ pub fn decompress(data: Bytes) -> Result<Bytes, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn decompress_bounded(data: Bytes, dict_limit: Int, limit: Int) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzdec.decompress_bounded")
+    let b = with_limit(with_dict_limit(decoder(), dict_limit), limit)
+    let (d, out) = feed(b, data)
+    match finish(d)
+        Err(f)   => Err(f)
+        Ok(tail) => Ok(out + tail)
 
 // The stream header a `.xz` starts with, without decoding anything.
 //
@@ -430,7 +1179,7 @@ pub fn decompress_bounded(data: Bytes, dict_limit: Int, limit: Int) -> Result<By
 //         Err(e) => println(e.message())
 // ```
 pub fn header_of(data: Bytes) -> Result<XzStreamHeader, XzFault> []
-    todo("xz-nv.xzdec.header_of")
+    xzstream.read_header(data)
 
 // The index of a whole `.xz` held in memory, read from its tail.
 //
@@ -451,7 +1200,25 @@ pub fn header_of(data: Bytes) -> Result<XzStreamHeader, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn index_of(data: Bytes) -> Result<XzIndex, XzFault> []
-    todo("xz-nv.xzdec.index_of")
+    if bytes.len(data) < xzstream.XZ_FOOTER_BYTES
+        return Err(xzerror.fault(
+            XzTruncated(xzstream.XZ_FOOTER_BYTES - bytes.len(data)),
+            at_stream(bytes.len(data))))
+    let tail = bytes.slice(data, bytes.len(data) - xzstream.XZ_FOOTER_BYTES,
+                           bytes.len(data))
+    match xzstream.read_footer(tail)
+        Err(f)     => Err(f)
+        Ok(footer) =>
+            // A file is a sequence of streams, and the index this
+            // answers with is the LAST stream's — which is the one
+            // `xz --list` prints for a single-stream file and the one
+            // a caller seeking to the end of a concatenated file
+            // wants.
+            let at = bytes.len(data) - xzstream.XZ_FOOTER_BYTES - footer.index_bytes
+            if at < 0
+                return Err(xzerror.fault(XzBadBackwardSize(footer.index_bytes),
+                                         at_stream(4)))
+            xzindex.read(data, at)
 
 // Decompress one block of an `.xz`, given its offset from the index.
 //
@@ -473,7 +1240,129 @@ pub fn index_of(data: Bytes) -> Result<XzIndex, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn decompress_block(data: Bytes, at: Int, dict_limit: Int) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzdec.decompress_block")
+    if at < 0 or at >= bytes.len(data)
+        return Err(xzerror.fault(XzBadBlockHeader(at),
+                                 xzerror.here(-1, at, xzerror.XZ_LAYER_BLOCK)))
+    match xzblock.read_header(data, at)
+        Err(f) => Err(f)
+        Ok(h)  =>
+            // The same machine over one block: the caller's offset is
+            // the start of the input, the stream header a whole file
+            // would have is not there, and the check type comes from
+            // the block's own context.  A block decoded this way is
+            // trusted only as far as its own check, which is exactly
+            // what the format promises and why `pixz` can work at all.
+            let size = match xzblock.header_bytes(h)
+                Ok(b)  => bytes.len(b)
+                Err(f) =>
+                    // cov: skip — the block header was read from this same buffer, so it is all there
+                    return Err(f)
+            let start = at + size
+            if start > bytes.len(data)
+                // cov: skip — the header was read out of this same buffer, so it is all there
+                return Err(xzerror.fault(XzTruncated(start - bytes.len(data)),
+                                         xzerror.here(-1, at, xzerror.XZ_LAYER_BLOCK)))
+            decode_one_block(data, start, h, dict_limit)
+
+// Decode one block whose header has already been read and whose body
+// starts at `start`.
+fn decode_one_block(data: Bytes, start: Int, h: XzBlockHeader,
+                    dict_limit: Int) -> Result<Bytes, XzFault> []
+    let f = compression_filter(h)
+    let byte = bytes.byte_at(f.props, 0) ?? -1
+    let window = match xzfilter.lzma2_dictionary_bytes(byte)
+        Ok(n)  => n
+        // cov: skip — the chain check refused a bad properties byte before this reads it
+        Err(_) => 0
+    if window <= 0
+        // cov: skip — the chain check refused a bad properties byte before this reads it
+        return Err(xzerror.fault(XzBadFilterProperties(f.id),
+                                 xzerror.here(-1, -1, xzerror.XZ_LAYER_FILTER)))
+    if dict_limit >= 0 and window > dict_limit
+        return Err(xzerror.fault(XzLimitReached(window, dict_limit),
+                                 xzerror.here(-1, start, xzerror.XZ_LAYER_BLOCK)))
+    var want = window
+    if want < XZ_DICT_BYTES_LEAST
+        want = XZ_DICT_BYTES_LEAST
+    if xzblock.has_uncompressed_size(h)
+        let floor = want
+        want = declared_reservation(floor, h.uncompressed_size, dict_limit)
+        // The whole input is in hand here, so a declared size is also
+        // held to what the bytes behind it can expand to.
+        let expansion = (bytes.len(data) - start + 1) * XZ_EXPANSION_MAX
+        if want > expansion
+            want = max_int(floor, expansion)
+    var size = want
+    loop
+        let lz = match xzlzma2.decoder(bytes.zeros(size), bytes.zeros(XZ_PROBS_BYTES))
+            Err(fault) =>
+                // cov: skip — the size starts at the 64 KiB floor and the probability buffer is the format's own count
+                return Err(fault)
+            Ok(l)      => l
+        let attempt = walk_chunks(lz, data, start)
+        match attempt
+            Err(fault)                  =>
+                // The dictionary is the output buffer, so a block that
+                // declares no size and outgrows its window is answered
+                // by doubling rather than by an allocation the caller
+                // did not ask for.
+                if xzerror.is_limit(fault.kind) and size < 2147483648
+                    size = size * 2
+                else
+                    return Err(fault)
+            Ok((lz2, produced, end_at)) =>
+                return finish_one_block(data, h, lz2, produced, end_at, start)
+    Err(xzerror.fault(XzTruncated(-1), xzerror.here(-1, start, xzerror.XZ_LAYER_BLOCK)))
+
+// Decode a block's chunks from `at` until its end marker.
+//
+// Answers the decoder, how much content there is, and where the end
+// marker was found.
+fn walk_chunks(lz: XzLzma2State, data: Bytes,
+               at: Int) -> Result<(XzLzma2State, Int, Int), XzFault> []
+    var cur = lz
+    var pos = at
+    loop
+        if pos >= bytes.len(data)
+            return Err(xzerror.fault(XzTruncated(1),
+                                     xzerror.here(-1, pos, xzerror.XZ_LAYER_LZMA2)))
+        if (bytes.byte_at(data, pos) ?? -1) == xzlzma2.XZ_LZMA2_END
+            return Ok((cur, xzlzma2.produced_of(cur), pos))
+        match xzlzma2.decode_chunk(var cur, data, pos)
+            Err(f)   =>
+                return Err(f)
+            Ok(next) =>
+                cur = next
+                pos = xzlzma2.consumed_of(cur)
+    Err(xzerror.fault(XzTruncated(-1), xzerror.here(-1, at, xzerror.XZ_LAYER_LZMA2)))
+
+// The tail of a block whose chunks have all been decoded: its filters
+// run backwards on the way in, and its two declared sizes.
+//
+// The check is NOT verified here, and cannot be: a block does not carry
+// its check type — its stream's header does — and `decompress_block` is
+// handed a block and an offset rather than a stream.  That is the whole
+// of what random access costs, and it is why the format wants a
+// whole-file reader to verify the stream's checks and this call to be
+// used for the blocks in between.
+fn finish_one_block(data: Bytes, h: XzBlockHeader, lz: XzLzma2State, produced: Int, at: Int,
+                    start: Int) -> Result<Bytes, XzFault> []
+    let data_bytes = at - start + 1
+    var content = bytes.clone(lz.dict)
+    var i = list.len(h.filters) - 2
+    while i >= 0
+        match xzfilter.decode_in_place(list.get(h.filters, i), var content, 0, produced)
+            Err(f) =>
+                // cov: skip — a converter chain `read_header` accepted cannot fail to apply
+                return Err(f)
+            Ok(b)  =>
+                content = bytes.clone(b)
+        i = i - 1
+    match xzblock.check_sizes(h, data_bytes, produced)
+        Err(f) =>
+            return Err(f)
+        Ok(_)  => ()
+    Ok(bytes.slice(content, 0, produced))
 
 // Decompress everything a stream yields.
 //
@@ -504,4 +1393,26 @@ pub fn decompress_block(data: Bytes, at: Int, dict_limit: Int) -> Result<Bytes, 
 //         Err(e) => println(e.message())
 // ```
 pub fn read_all<S: Read[e]>(src: S) -> Result<Bytes, XzFault> [e]
-    todo("xz-nv.xzdec.read_all")
+    // The pump is written once and the effect is the source's: this
+    // function calls `read` and nothing else, so it charges exactly
+    // what the impl behind `S` charges and not one effect more.
+    var d = decoder()
+    var parts: [Bytes] = []
+    loop
+        match src.read(65536)
+            Err(_)    =>
+                return Err(
+                xzerror.fault(XzSourceFailed,
+                              xzerror.here(-1, -1, xzerror.XZ_LAYER_STREAM)))
+            Ok(chunk) =>
+                if bytes.len(chunk) == 0
+                    break
+                let (next, out) = feed(d, chunk)
+                d = next
+                if bytes.len(out) > 0
+                    list.push(parts, bytes.clone(out))
+    match finish(d)
+        Err(f)   => Err(f)
+        Ok(tail) =>
+            list.push(parts, bytes.clone(tail))
+            Ok(joined(parts))

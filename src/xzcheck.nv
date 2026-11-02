@@ -1,9 +1,6 @@
 // xzcheck.nv — the four integrity checks an `.xz` block may carry, and
 // the one of them nobody else on this registry publishes.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // THE CHECK TYPE IS A STREAM-LEVEL DECISION AND A BLOCK-LEVEL FIELD.
 // The stream header's flags name one check type for the whole stream;
 // every block then carries a check of that type after its compressed
@@ -93,7 +90,15 @@ pub const XZ_CRC64_CHECK = 0x995DC9BBDF1939FA
 //         Err(_) => println("not a check type")
 // ```
 pub fn size_of(check: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzcheck.size_of")
+    if check < 0 or check > 0x0F
+        return Err(xzerror.fault(
+            XzBadParameter("size_of: a check type outside 0 to 15"),
+            xzerror.here(-1, -1, xzerror.XZ_LAYER_CHECK)))
+    if check == XZ_CHECK_NONE
+        return Ok(0)
+    // Three types per doubling, so the group is `(check - 1) / 3` and
+    // the width doubles with it: 4, 8, 16, 32, 64.
+    Ok(4 << ((check - 1) / 3))
 
 // Whether this package can verify a check of that type.
 //
@@ -108,7 +113,8 @@ pub fn size_of(check: Int) -> Result<Int, XzFault> []
 //     println("${xzcheck.is_supported(xzcheck.XZ_CHECK_SHA256)}")
 // ```
 pub fn is_supported(check: Int) -> Bool []
-    todo("xz-nv.xzcheck.is_supported")
+    check == XZ_CHECK_NONE or check == XZ_CHECK_CRC32
+        or check == XZ_CHECK_CRC64 or check == XZ_CHECK_SHA256
 
 // A short, stable name for a check type: `"none"`, `"crc32"`,
 // `"crc64"`, `"sha256"`, or `"reserved-N"`.
@@ -120,7 +126,12 @@ pub fn is_supported(check: Int) -> Bool []
 //     println(xzcheck.name_of(xzcheck.XZ_CHECK_CRC32))
 // ```
 pub fn name_of(check: Int) -> Str []
-    todo("xz-nv.xzcheck.name_of")
+    match check
+        XZ_CHECK_NONE   => "none"
+        XZ_CHECK_CRC32  => "crc32"
+        XZ_CHECK_CRC64  => "crc64"
+        XZ_CHECK_SHA256 => "sha256"
+        _               => "reserved-${check}"
 
 // A check being computed over a block's content, as the decoder
 // carries it.
@@ -165,7 +176,18 @@ pub struct XzCheck
 //         Err(f) => println(f.message())
 // ```
 pub fn start(check: Int) -> Result<XzCheck, XzFault> []
-    todo("xz-nv.xzcheck.start")
+    if not is_supported(check)
+        return Err(xzerror.fault(XzUnsupportedCheck(check),
+                                 xzerror.here(-1, -1, xzerror.XZ_LAYER_CHECK)))
+    let fresh = match check
+        XZ_CHECK_CRC32 =>
+            let algo = crc.crc32()
+            XzCheck { kind: check, crc: algo.start(), digest: bytes.zeros(0), fed: 0 }
+        XZ_CHECK_CRC64 =>
+            XzCheck { kind: check, crc: crc64_init(), digest: bytes.zeros(0), fed: 0 }
+        _              =>
+            XzCheck { kind: check, crc: 0, digest: bytes.zeros(0), fed: 0 }
+    Ok(fresh)
 
 // Fold `n` bytes of `src` from `off` into a running check.
 //
@@ -183,7 +205,25 @@ pub fn start(check: Int) -> Result<XzCheck, XzFault> []
 //         Err(_) => println("not a check type")
 // ```
 pub fn update(s: XzCheck, src: Bytes, off: Int, n: Int) -> XzCheck []
-    todo("xz-nv.xzcheck.update")
+    match s.kind
+        XZ_CHECK_CRC32  =>
+            let algo = crc.crc32()
+            XzCheck { kind: s.kind, crc: algo.update_range(s.crc, src, off, n),
+                      digest: s.digest, fed: s.fed + n }
+        XZ_CHECK_CRC64  =>
+            XzCheck { kind: s.kind, crc: crc64_update(s.crc, src, off, n),
+                      digest: s.digest, fed: s.fed + n }
+        XZ_CHECK_SHA256 =>
+            // This type is the one whose state does not fit in an
+            // `Int`, so the bytes are held until `finish` hands them to
+            // crypto-nv in one call.  The decoder feeds a block once,
+            // so the copy happens once per block rather than once per
+            // chunk.
+            var grown = bytes.zeros(bytes.len(s.digest) + n)
+            grown = bytes.copy_into(grown, 0, s.digest, 0, bytes.len(s.digest))
+            grown = bytes.copy_into(grown, bytes.len(s.digest), src, off, n)
+            XzCheck { kind: s.kind, crc: 0, digest: grown, fed: s.fed + n }
+        _               => XzCheck { kind: s.kind, crc: s.crc, digest: s.digest, fed: s.fed + n }
 
 // The check's final bytes, in the order the file carries them.
 //
@@ -201,7 +241,18 @@ pub fn update(s: XzCheck, src: Bytes, off: Int, n: Int) -> XzCheck []
 //         Err(_) => println("not a check type")
 // ```
 pub fn finish(s: XzCheck) -> Bytes []
-    todo("xz-nv.xzcheck.finish")
+    match s.kind
+        XZ_CHECK_NONE  => bytes.zeros(0)
+        XZ_CHECK_CRC32 =>
+            let algo = crc.crc32()
+            var out32 = bytes.zeros(4)
+            bytes.set_u32_le(out32, 0, algo.finish(s.crc))
+            out32
+        XZ_CHECK_CRC64 =>
+            var out64 = bytes.zeros(8)
+            bytes.set_u64_le(out64, 0, crc64_finish(s.crc))
+            out64
+        _              => hashing.sha256(s.digest)
 
 // Which type a running check is.
 //
@@ -214,7 +265,7 @@ pub fn finish(s: XzCheck) -> Bytes []
 //         Err(_) => println("not a check type")
 // ```
 pub fn kind_of(s: XzCheck) -> Int []
-    todo("xz-nv.xzcheck.kind_of")
+    s.kind
 
 // How many bytes have been fed into a running check.
 //
@@ -231,7 +282,7 @@ pub fn kind_of(s: XzCheck) -> Int []
 //         Err(_) => println("not a check type")
 // ```
 pub fn fed_bytes(s: XzCheck) -> Int []
-    todo("xz-nv.xzcheck.fed_bytes")
+    s.fed
 
 // Whether a finished check equals the bytes the file carried.
 //
@@ -249,7 +300,15 @@ pub fn fed_bytes(s: XzCheck) -> Int []
 //         Err(_) => println("not a check type")
 // ```
 pub fn matches(s: XzCheck, declared: Bytes) -> Bool []
-    todo("xz-nv.xzcheck.matches")
+    let mine = finish(s)
+    if bytes.len(mine) != bytes.len(declared)
+        return false
+    // Every byte is read whatever the first disagreement was, so the
+    // time taken does not name how many bytes matched.
+    var diff = 0
+    for i in 0..bytes.len(mine)
+        diff = diff | ((bytes.byte_at(mine, i) ?? 0) ^ (bytes.byte_at(declared, i) ?? 0))
+    diff == 0
 
 // A fresh CRC-64/XZ register: all ones.
 //
@@ -260,7 +319,7 @@ pub fn matches(s: XzCheck, declared: Bytes) -> Bool []
 //     println("${xzcheck.crc64_init()}")
 // ```
 pub fn crc64_init() -> Int []
-    todo("xz-nv.xzcheck.crc64_init")
+    0 - 1
 
 // Fold `n` bytes of `src` from `off` into a CRC-64/XZ register.
 //
@@ -273,7 +332,14 @@ pub fn crc64_init() -> Int []
 //     println("${xzcheck.crc64_update(xzcheck.crc64_init(), s, 0, 9)}")
 // ```
 pub fn crc64_update(crc: Int, src: Bytes, off: Int, n: Int) -> Int []
-    todo("xz-nv.xzcheck.crc64_update")
+    var running = crc
+    for i in off..off + n
+        // The reflected algorithm: the low byte selects the entry and
+        // the register shifts right into it.  `>>>` and not `>>`,
+        // because the register is a bit pattern that has no sign.
+        let index = (running ^ (bytes.byte_at(src, i) ?? 0)) & 0xFF
+        running = crc64_table_entry(index) ^ (running >>> 8)
+    running
 
 // Finish a CRC-64/XZ register: complement it.
 //
@@ -284,7 +350,7 @@ pub fn crc64_update(crc: Int, src: Bytes, off: Int, n: Int) -> Int []
 //     println("${xzcheck.crc64_finish(xzcheck.crc64_init())}")
 // ```
 pub fn crc64_finish(crc: Int) -> Int []
-    todo("xz-nv.xzcheck.crc64_finish")
+    crc ^ (0 - 1)
 
 // The CRC-64/XZ of a whole buffer, the three calls above in one.
 //
@@ -296,7 +362,7 @@ pub fn crc64_finish(crc: Int) -> Int []
 //     println("${xzcheck.crc64(bytes.from_str("123456789"))}")
 // ```
 pub fn crc64(data: Bytes) -> Int []
-    todo("xz-nv.xzcheck.crc64")
+    crc64_finish(crc64_update(crc64_init(), data, 0, bytes.len(data)))
 
 // One entry of the 256-entry CRC-64/XZ table.
 //
@@ -312,4 +378,10 @@ pub fn crc64(data: Bytes) -> Int []
 //     println("${xzcheck.crc64_table_entry(0)}")
 // ```
 pub fn crc64_table_entry(i: Int) -> Int []
-    todo("xz-nv.xzcheck.crc64_table_entry")
+    var c = i & 0xFF
+    for _bit in 0..8
+        if (c & 1) != 0
+            c = XZ_CRC64_POLY ^ (c >>> 1)
+        else
+            c = c >>> 1
+    c

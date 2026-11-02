@@ -1,9 +1,6 @@
 // xzindex.nv — the table of contents at the back of every `.xz` file,
 // and the reason `.xz` can be seeked and `.gz` cannot.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // THE INDEX IS WHY THE FORMAT PUTS ITS METADATA AT THE END.  A reader
 // that can seek takes the last twelve bytes, reads the footer's
 // backward size, jumps that far back, and has one record per block —
@@ -30,6 +27,8 @@
 // an order that a per-block check cannot.
 
 use xzerror
+use xzvli
+use crc
 
 // The byte that introduces the index: `0x00`.
 //
@@ -37,6 +36,15 @@ use xzerror
 // what lets a decoder tell "another block" from "the table of
 // contents" with no look-ahead.
 pub const XZ_INDEX_INDICATOR_BYTE = 0x00
+
+// The finished CRC-32 of `n` bytes of `src` from `off`.
+//
+// The index checksums itself the way the two headers do, and the
+// algorithm value is bound before it is used so the 256-entry table is
+// built once per call and dropped with the binding.
+fn crc32_of(src: Bytes, off: Int, n: Int) -> Int
+    let algo = crc.crc32()
+    algo.finish(algo.update_range(algo.start(), src, off, n))
 
 // One index record: a block's unpadded size and its uncompressed size.
 //
@@ -63,7 +71,7 @@ pub struct XzIndexRecord
 //     println("${xzindex.record(116, 65536).unpadded}")
 // ```
 pub fn record(unpadded: Int, uncompressed: Int) -> XzIndexRecord []
-    todo("xz-nv.xzindex.record")
+    XzIndexRecord { unpadded: unpadded, uncompressed: uncompressed }
 
 // A stream's whole index.
 //
@@ -86,7 +94,7 @@ pub struct XzIndex
 //     println("${xzindex.block_count(xzindex.index([]))}")
 // ```
 pub fn index(records: [XzIndexRecord]) -> XzIndex []
-    todo("xz-nv.xzindex.index")
+    XzIndex { records: records }
 
 // Read an index from `src` at `off`.
 //
@@ -109,7 +117,87 @@ pub fn index(records: [XzIndexRecord]) -> XzIndex []
 //         Err(e) => println(e.message())
 // ```
 pub fn read(src: Bytes, off: Int) -> Result<XzIndex, XzFault> []
-    todo("xz-nv.xzindex.read")
+    let at = xzerror.here(-1, off, xzerror.XZ_LAYER_INDEX)
+    if bytes.len(src) <= off
+        return Err(xzerror.fault(XzTruncated(off + 1 - bytes.len(src)), at))
+    if (bytes.byte_at(src, off) ?? -1) != XZ_INDEX_INDICATOR_BYTE
+        return Err(xzerror.fault(XzBadBlockHeader(off), at))
+    let count_vli = xzvli.decode(src, off + 1)
+    match xzvli.decode_fault(count_vli, off + 1)
+        Some(f) =>
+            return Err(f)
+        None    => ()
+    let count = count_vli.value
+    // A count the buffer cannot possibly hold is refused before any
+    // record is read, so a corrupt file cannot ask this loop for
+    // 2^63 records.
+    if count < 0 or count > (bytes.len(src) - off) / 2
+        return Err(xzerror.fault(
+            XzIndexMismatch("the record count is larger than the index can hold"), at))
+    var pos = off + 1 + count_vli.bytes
+    var seen: [XzIndexRecord] = []
+    for _ in 0..count
+        let unpadded_vli = xzvli.decode(src, pos)
+        match xzvli.decode_fault(unpadded_vli, pos)
+            Some(f) =>
+                return Err(f)
+            None    => ()
+        pos = pos + unpadded_vli.bytes
+        let size_vli = xzvli.decode(src, pos)
+        match xzvli.decode_fault(size_vli, pos)
+            Some(f) =>
+                return Err(f)
+            None    => ()
+        pos = pos + size_vli.bytes
+        seen = list.push(seen, XzIndexRecord { unpadded: unpadded_vli.value,
+                                               uncompressed: size_vli.value })
+    let padded = xzvli.round_up(pos - off)
+    if not xzvli.padding_is_clean(src, pos, padded - (pos - off))
+        return Err(xzerror.fault(XzIndexMismatch("the index padding is not zeroes"), at))
+    let crc_at = off + padded
+    let declared = bytes.u32_le_at(src, crc_at) ?? -1
+    let computed = crc32_of(src, off, padded)
+    if declared != computed
+        return Err(xzerror.fault(XzHeaderCrcMismatch(declared, computed), at))
+    Ok(XzIndex { records: seen })
+
+// How many bytes a size takes in an index.  Every size in an index is
+// a value `xzvli.encoded_bytes` has an answer for; the fallback is the
+// value a negative one would have taken, and `read` cannot produce one.
+fn vli_len(n: Int) -> Int
+    match xzvli.encoded_bytes(n)
+        Ok(w)  => w
+        Err(_) => 1
+
+// The index's own bytes: the indicator, the record count and the
+// records, with neither the padding nor the trailing CRC.
+//
+// The half that the writer and the sizer share, so the two cannot
+// disagree about how long an index is.
+fn index_body(i: XzIndex) -> Bytes
+    let n = list.len(i.records)
+    var size = 1 + vli_len(n)
+    for r in i.records
+        size = size + vli_len(r.unpadded) + vli_len(r.uncompressed)
+    var out = bytes.zeros(size)
+    var at = 0
+    bytes.set_u8(out, at, XZ_INDEX_INDICATOR_BYTE)
+    at = at + 1
+    match xzvli.encode_into(n, var out, at)
+        Ok(w)  =>
+            at = at + w
+        // cov: skip — `encoded_bytes` sized the record before this writes it
+        Err(_) => ()
+    for r in i.records
+        match xzvli.encode_into(r.unpadded, var out, at)
+            Ok(w)  =>
+                at = at + w
+            Err(_) => ()
+        match xzvli.encode_into(r.uncompressed, var out, at)
+            Ok(w)  =>
+                at = at + w
+            Err(_) => ()
+    out
 
 // The bytes an index encodes to, padded to a multiple of four and
 // checksummed.
@@ -124,7 +212,12 @@ pub fn read(src: Bytes, off: Int) -> Result<XzIndex, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn encode(i: XzIndex) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzindex.encode")
+    let body = index_body(i)
+    let total = xzvli.round_up(bytes.len(body)) + 4
+    var out = bytes.zeros(total)
+    out = bytes.copy_into(out, 0, body, 0, bytes.len(body))
+    bytes.set_u32_le(out, total - 4, crc32_of(out, 0, total - 4))
+    Ok(out)
 
 // How many blocks the index describes.
 //
@@ -135,7 +228,7 @@ pub fn encode(i: XzIndex) -> Result<Bytes, XzFault> []
 //     println("${xzindex.block_count(xzindex.index([]))}")
 // ```
 pub fn block_count(i: XzIndex) -> Int []
-    todo("xz-nv.xzindex.block_count")
+    list.len(i.records)
 
 // The file's total uncompressed size, from the index alone.
 //
@@ -149,7 +242,10 @@ pub fn block_count(i: XzIndex) -> Int []
 //     println("${xzindex.total_uncompressed(xzindex.index([]))}")
 // ```
 pub fn total_uncompressed(i: XzIndex) -> Int []
-    todo("xz-nv.xzindex.total_uncompressed")
+    var total = 0
+    for r in i.records
+        total = total + r.uncompressed
+    total
 
 // The file's total compressed size, from the index alone: the sum of
 // the unpadded sizes with each block's padding added back.
@@ -161,7 +257,10 @@ pub fn total_uncompressed(i: XzIndex) -> Int []
 //     println("${xzindex.total_compressed(xzindex.index([]))}")
 // ```
 pub fn total_compressed(i: XzIndex) -> Int []
-    todo("xz-nv.xzindex.total_compressed")
+    var total = 0
+    for r in i.records
+        total = total + xzvli.round_up(r.unpadded)
+    total
 
 // How many bytes an index of `n` records occupies, before its padding.
 //
@@ -177,7 +276,7 @@ pub fn total_compressed(i: XzIndex) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn encoded_bytes(i: XzIndex) -> Result<Int, XzFault> []
-    todo("xz-nv.xzindex.encoded_bytes")
+    Ok(xzvli.round_up(bytes.len(index_body(i))) + 4)
 
 // Where each block starts, in compressed bytes from the stream's first
 // byte.
@@ -193,7 +292,13 @@ pub fn encoded_bytes(i: XzIndex) -> Result<Int, XzFault> []
 //     println("${list.len(xzindex.offsets_of(xzindex.index([])))}")
 // ```
 pub fn offsets_of(i: XzIndex) -> [Int] []
-    todo("xz-nv.xzindex.offsets_of")
+    var out: [Int] = []
+    // The first block starts after the twelve-byte stream header.
+    var at = 12
+    for r in i.records
+        out = list.push(out, at)
+        at = at + xzvli.round_up(r.unpadded)
+    out
 
 // Which block a given uncompressed offset falls in, or `-1` past the
 // end.
@@ -209,7 +314,15 @@ pub fn offsets_of(i: XzIndex) -> [Int] []
 //     println("${xzindex.block_at(xzindex.index([]), 0)}")
 // ```
 pub fn block_at(i: XzIndex, uncompressed_offset: Int) -> Int []
-    todo("xz-nv.xzindex.block_at")
+    if uncompressed_offset < 0
+        return -1
+    var start = 0
+    for n in 0..list.len(i.records)
+        let r = list.get(i.records, n)
+        if uncompressed_offset < start + r.uncompressed
+            return n
+        start = start + r.uncompressed
+    -1
 
 // Whether an index agrees with the blocks a decoder actually read.
 //
@@ -231,4 +344,17 @@ pub fn block_at(i: XzIndex, uncompressed_offset: Int) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn agrees_with(i: XzIndex, read_records: [XzIndexRecord]) -> Result<Int, XzFault> []
-    todo("xz-nv.xzindex.agrees_with")
+    let at = xzerror.here(-1, -1, xzerror.XZ_LAYER_INDEX)
+    if list.len(i.records) != list.len(read_records)
+        return Err(xzerror.fault(
+            XzIndexMismatch("the record count is not the number of blocks that were read"), at))
+    for n in 0..list.len(i.records)
+        let mine = list.get(i.records, n)
+        let theirs = list.get(read_records, n)
+        if mine.unpadded != theirs.unpadded
+            return Err(xzerror.fault(
+                XzIndexMismatch("record ${n} names a different unpadded size"), at))
+        if mine.uncompressed != theirs.uncompressed
+            return Err(xzerror.fault(
+                XzIndexMismatch("record ${n} names a different uncompressed size"), at))
+    Ok(list.len(i.records))

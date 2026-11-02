@@ -1,13 +1,10 @@
 // xzblock.nv — a block header, its filter chain, and the three sizes a
 // block has to agree with itself about.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // A BLOCK HEADER STARTS WITH ITS OWN SIZE, and that byte is also how a
 // decoder tells a block from the index: a first byte of zero is the
 // index indicator, and any other value is `(size / 4) - 1` for a block
-// header of four to 1024 bytes.  So the very first byte after a
+// header of eight to 1024 bytes.  So the very first byte after a
 // block's padding answers "is there another block, or is this the
 // table of contents", with no look-ahead.
 //
@@ -20,6 +17,13 @@
 // individually decodable and is the whole basis of `pixz`'s parallel
 // decompression.
 //
+// THE FILTER COUNT IS NOT A FIELD OF ITS OWN: the low two bits of the
+// flags byte hold it minus one, so a reader that has the flags knows
+// how many filter records to expect and where the header padding
+// starts.  There is no terminator byte to scan for, and a reader that
+// looks for one reads the padding as a filter and the CRC as its
+// properties.
+//
 // THE FILTER CHAIN IS AT MOST FOUR FILTERS AND THE LAST IS THE
 // COMPRESSOR.  A chain is applied in order on the way out and in
 // reverse on the way in, so the decoder reads the LAST filter's output
@@ -31,8 +35,10 @@
 // header is distinguishable from a header that asks for something this
 // package does not implement.
 
+use crc
 use xzerror
 use xzfilter
+use xzvli
 
 // The smallest a block header may be: 8 bytes.
 pub const XZ_BLOCK_HEADER_BYTES_LEAST = 8
@@ -47,6 +53,98 @@ pub const XZ_INDEX_INDICATOR = 0x00
 
 // The most filters a chain may hold: 4.
 pub const XZ_FILTERS_MOST = 4
+
+// The Block Flags bit that says the compressed size field follows: 0x40.
+const XZ_BLOCK_FLAG_COMPRESSED = 0x40
+
+// The Block Flags bit that says the uncompressed size field follows: 0x80.
+const XZ_BLOCK_FLAG_UNCOMPRESSED = 0x80
+
+// The two Block Flags bits that hold the number of filters, minus one.
+const XZ_BLOCK_FLAG_FILTERS = 0x03
+
+// The Block Flags bits the format reserves: 0x3C.
+//
+// A file with one of them set was written by something that knows a
+// field this reader does not, which is why the spec says the decoder
+// MUST refuse it rather than skip what it does not understand.
+const XZ_BLOCK_FLAGS_RESERVED = 0x3C
+
+// The first filter ID that is reserved for implementations rather than
+// defined by the format: `2^62`.
+//
+// The spec says such an ID MUST never appear in a header, so a file
+// using one is damaged and not merely unsupported — which is the
+// difference between a version of the format this package has not
+// caught up with and a header nothing ever wrote.
+const XZ_FILTER_ID_RESERVED = 0x4000000000000000
+
+// Where a fault in a block header happened.
+fn here(off: Int) -> XzWhere
+    xzerror.here(-1, off, xzerror.XZ_LAYER_BLOCK)
+
+// A header the format does not allow: a size byte the range refuses, a
+// flags byte with a reserved bit or a count, a field that does not fit
+// the header's own size, or padding that is not zeroes.
+fn bad_header(at: Int) -> XzFault
+    xzerror.fault(XzBadBlockHeader(at), here(at))
+
+// A header whose CRC-32 does not match its own bytes.
+fn crc_mismatch(declared: Int, computed: Int) -> XzFault
+    xzerror.fault(XzHeaderCrcMismatch(declared, computed), here(-1))
+
+// Two sizes that disagree, carrying the declared number and the actual
+// one so a caller can say which way the file lied.
+fn size_mismatch(declared: Int, actual: Int) -> XzFault
+    xzerror.fault(XzSizeMismatch(declared, actual), here(-1))
+
+// A parameter outside what a function allows.
+fn bad_parameter(what: Str) -> XzFault
+    xzerror.fault(XzBadParameter(what), here(-1))
+
+// The finished CRC-32 of `n` bytes of `src` from `off`.
+//
+// The algorithm value is bound before it is used, because a field read
+// off a call in one expression is the shape that leaks — and because
+// `crc.crc32()` builds a 256-entry table that should be built once per
+// check rather than once per call.
+fn crc32_of(src: Bytes, off: Int, n: Int) -> Int
+    let algo = crc.crc32()
+    algo.finish(algo.update_range(algo.start(), src, off, n))
+
+// A value as the variable-length integer that encodes it.
+//
+// Every value this module passes here is one `xzvli.encode` has an
+// answer for — a size the header already carried, or a length out of a
+// buffer — so the empty answer is the one for a value the format
+// cannot encode at all, and it cannot arise through `header_bytes`.
+fn vli_bytes(n: Int) -> Bytes
+    match xzvli.encode(n)
+        Ok(b)  => b
+        // cov: skip — only a non-negative size reaches this: every caller passes a length the header already carries
+        Err(_) => bytes.zeros(0)
+
+// The header's bytes from its flags byte to the last filter's last
+// properties byte, with neither the size byte, nor the padding, nor
+// the CRC.
+//
+// The half that the writer and `header_bytes`'s own size arithmetic
+// share, so the two cannot disagree about how long a header is.
+fn body_of(h: XzBlockHeader) -> Bytes
+    let count = list.len(h.filters)
+    var flags = (count - 1) & XZ_BLOCK_FLAG_FILTERS
+    if h.compressed_size >= 0
+        flags = flags | XZ_BLOCK_FLAG_COMPRESSED
+    if h.uncompressed_size >= 0
+        flags = flags | XZ_BLOCK_FLAG_UNCOMPRESSED
+    var body = bytes.u8(flags)
+    if h.compressed_size >= 0
+        body = body + vli_bytes(h.compressed_size)
+    if h.uncompressed_size >= 0
+        body = body + vli_bytes(h.uncompressed_size)
+    for f in h.filters
+        body = body + vli_bytes(f.id) + vli_bytes(bytes.len(f.props)) + f.props
+    body
 
 // A block header.
 //
@@ -83,7 +181,8 @@ pub struct XzBlockHeader
 //     println("${xzblock.header([], -1, -1).compressed_size}")
 // ```
 pub fn header(filters: [XzFilter], compressed: Int, uncompressed: Int) -> XzBlockHeader []
-    todo("xz-nv.xzblock.header")
+    XzBlockHeader { filters: filters, compressed_size: compressed,
+                    uncompressed_size: uncompressed }
 
 // What the first byte after a block's padding means.
 //
@@ -98,7 +197,9 @@ pub fn header(filters: [XzFilter], compressed: Int, uncompressed: Int) -> XzBloc
 //     println("${xzblock.header_size_from(xzblock.XZ_INDEX_INDICATOR)}")
 // ```
 pub fn header_size_from(first: Int) -> Int []
-    todo("xz-nv.xzblock.header_size_from")
+    if first == XZ_INDEX_INDICATOR
+        return 0
+    (first + 1) * 4
 
 // Read a block header from `src` at `off`.
 //
@@ -118,7 +219,101 @@ pub fn header_size_from(first: Int) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn read_header(src: Bytes, off: Int) -> Result<XzBlockHeader, XzFault> []
-    todo("xz-nv.xzblock.read_header")
+    let first = bytes.byte_at(src, off) ?? -1
+    if first < 0
+        return Err(xzerror.fault(XzTruncated(1), here(off)))
+    // Zero here is the index indicator: there is no block header to
+    // read, and a caller that asked for one at the table of contents
+    // has lost its place.
+    if first == XZ_INDEX_INDICATOR
+        return Err(bad_header(off))
+    let size = header_size_from(first)
+    if off + size > bytes.len(src)
+        return Err(xzerror.fault(XzTruncated(off + size - bytes.len(src)), here(off)))
+    // THE CRC IS CHECKED BEFORE ANYTHING INSIDE IT IS BELIEVED, which
+    // is the order the format asks for: it is what lets a reader tell a
+    // damaged header from one that asks for a filter this package does
+    // not have, and the two get different faults because of it.
+    let stored = bytes.u32_le_at(src, off + size - 4) ?? -1
+    let computed = crc32_of(src, off, size - 4)
+    if stored != computed
+        return Err(crc_mismatch(stored, computed))
+    let flags = bytes.byte_at(src, off + 1) ?? 0
+    if (flags & XZ_BLOCK_FLAGS_RESERVED) != 0
+        return Err(bad_header(off + 1))
+    // The last byte the fields may reach: the header minus its CRC.
+    let end = off + size - 4
+    var at = off + 2
+    var compressed = -1
+    if (flags & XZ_BLOCK_FLAG_COMPRESSED) != 0
+        let v = xzvli.decode(src, at)
+        match xzvli.decode_fault(v, at)
+            Some(f) =>
+                return Err(f)
+            None    => ()
+        // A field the header says is there but cannot hold is the
+        // header's own size disagreeing with its contents.
+        if at + v.bytes > end
+            return Err(bad_header(at))
+        compressed = v.value
+        at = at + v.bytes
+        // The format says a stored compressed size MUST be non-zero:
+        // a block always holds at least its filter's end marker.
+        if compressed == 0
+            return Err(bad_header(at))
+    var uncompressed = -1
+    if (flags & XZ_BLOCK_FLAG_UNCOMPRESSED) != 0
+        let v = xzvli.decode(src, at)
+        match xzvli.decode_fault(v, at)
+            Some(f) =>
+                return Err(f)
+            None    => ()
+        if at + v.bytes > end
+            return Err(bad_header(at))
+        uncompressed = v.value
+        at = at + v.bytes
+    let count = (flags & XZ_BLOCK_FLAG_FILTERS) + 1
+    var filters: [XzFilter] = []
+    for _ in 0..count
+        let id_v = xzvli.decode(src, at)
+        match xzvli.decode_fault(id_v, at)
+            Some(f) =>
+                return Err(f)
+            None    => ()
+        if at + id_v.bytes > end
+            return Err(bad_header(at))
+        at = at + id_v.bytes
+        let len_v = xzvli.decode(src, at)
+        match xzvli.decode_fault(len_v, at)
+            Some(f) =>
+                return Err(f)
+            None    => ()
+        if at + len_v.bytes > end
+            return Err(bad_header(at))
+        at = at + len_v.bytes
+        if id_v.value >= XZ_FILTER_ID_RESERVED
+            return Err(bad_header(at))
+        // `end - at` rather than `at + len`, so a length of 2^63-1
+        // cannot wrap the sum round into looking like it fits.
+        if len_v.value > end - at
+            return Err(bad_header(at))
+        filters = list.push(filters, XzFilter { id: id_v.value,
+                                                props: bytes.slice(src, at, at + len_v.value) })
+        at = at + len_v.value
+    // Header padding: null bytes up to the CRC.  Checked rather than
+    // skipped, because a decoder that skipped it would accept a file
+    // with a second header hidden in it.
+    if not xzvli.padding_is_clean(src, at, end - at)
+        return Err(bad_header(at))
+    // The chain's own rules — one compression filter, last, no
+    // converter twice — plus, inside `check_chain`, whether each
+    // filter's properties are the size and the value the format gives
+    // it.  A filter ID nothing implements is answered there too.
+    match xzfilter.check_chain(filters)
+        Err(f) => Err(f)
+        Ok(_)  => Ok(XzBlockHeader { filters: filters,
+                                     compressed_size: compressed,
+                                     uncompressed_size: uncompressed })
 
 // The bytes a block header encodes to, padded to a multiple of four
 // and checksummed.
@@ -133,7 +328,27 @@ pub fn read_header(src: Bytes, off: Int) -> Result<XzBlockHeader, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn header_bytes(h: XzBlockHeader) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzblock.header_bytes")
+    // An empty chain, two compression filters, a compressor that is
+    // not last, a converter twice, a filter ID nothing implements, or
+    // properties of the wrong size: `check_chain` is all six, and a
+    // writer that skipped it would produce a file every decoder
+    // refuses.
+    match xzfilter.check_chain(h.filters)
+        Err(f) => Err(f)
+        Ok(_)  =>
+            if h.compressed_size == 0
+                return Err(bad_header(0))
+            let body = body_of(h)
+            let total = xzvli.round_up(1 + bytes.len(body) + 4)
+            if total > XZ_BLOCK_HEADER_BYTES_MOST
+                // cov: skip — a chain of four filters with one- or four-byte properties cannot fill a 1024-byte header
+                return Err(bad_parameter(
+                    "header_bytes: the filter chain does not fit in a 1024-byte block header"))
+            var out = bytes.zeros(total)
+            bytes.set_u8(out, 0, total / 4 - 1)
+            out = bytes.copy_into(out, 1, body, 0, bytes.len(body))
+            bytes.set_u32_le(out, total - 4, crc32_of(out, 0, total - 4))
+            Ok(out)
 
 // Whether a block header declares its compressed size.
 //
@@ -148,7 +363,7 @@ pub fn header_bytes(h: XzBlockHeader) -> Result<Bytes, XzFault> []
 //     println("${xzblock.has_compressed_size(xzblock.header([], -1, -1))}")
 // ```
 pub fn has_compressed_size(h: XzBlockHeader) -> Bool []
-    todo("xz-nv.xzblock.has_compressed_size")
+    h.compressed_size >= 0
 
 // Whether a block header declares its uncompressed size.
 //
@@ -159,7 +374,7 @@ pub fn has_compressed_size(h: XzBlockHeader) -> Bool []
 //     println("${xzblock.has_uncompressed_size(xzblock.header([], -1, 64))}")
 // ```
 pub fn has_uncompressed_size(h: XzBlockHeader) -> Bool []
-    todo("xz-nv.xzblock.has_uncompressed_size")
+    h.uncompressed_size >= 0
 
 // Check a block's actual sizes against what its header declared.
 //
@@ -167,6 +382,10 @@ pub fn has_uncompressed_size(h: XzBlockHeader) -> Bool []
 // field that was absent is not checked, which is the whole of the
 // optionality: absent means "find the end from the filter chain", not
 // "any size will do".
+//
+// Answers how many of the two fields were present and confirmed, so a
+// caller can tell a block that checked both from one that declared
+// neither.
 //
 // ```novo
 // use xzblock
@@ -177,7 +396,16 @@ pub fn has_uncompressed_size(h: XzBlockHeader) -> Bool []
 //         Err(e) => println(e.message())
 // ```
 pub fn check_sizes(h: XzBlockHeader, compressed: Int, uncompressed: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzblock.check_sizes")
+    var confirmed = 0
+    if has_compressed_size(h)
+        if h.compressed_size != compressed
+            return Err(size_mismatch(h.compressed_size, compressed))
+        confirmed = confirmed + 1
+    if has_uncompressed_size(h)
+        if h.uncompressed_size != uncompressed
+            return Err(size_mismatch(h.uncompressed_size, uncompressed))
+        confirmed = confirmed + 1
+    Ok(confirmed)
 
 // The unpadded size a block of these dimensions contributes to the
 // index.
@@ -199,7 +427,9 @@ pub fn check_sizes(h: XzBlockHeader, compressed: Int, uncompressed: Int) -> Resu
 // ```
 pub fn unpadded_size(header_bytes_len: Int, compressed: Int,
                      check_bytes: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzblock.unpadded_size")
+    if header_bytes_len < 0 or compressed < 0 or check_bytes < 0
+        return Err(bad_parameter("unpadded_size: a negative length"))
+    Ok(header_bytes_len + compressed + check_bytes)
 
 // How many bytes of block padding follow compressed data of `n` bytes:
 // `0` ..= `3`.
@@ -211,4 +441,7 @@ pub fn unpadded_size(header_bytes_len: Int, compressed: Int,
 //     println("${xzblock.padding_after(5)}")
 // ```
 pub fn padding_after(n: Int) -> Int []
-    todo("xz-nv.xzblock.padding_after")
+    // The same rule, and the same function, that pads the index and
+    // the stream: `xzvli` owns the modulo so three callers cannot
+    // disagree about it.
+    xzvli.padding_after(n)

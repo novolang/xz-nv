@@ -1,9 +1,6 @@
 // xzfilter.nv — the filter chain: one compressor, and up to three
 // transforms in front of it that do not compress anything.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // A FILTER THAT DOES NOT COMPRESS IS STILL WORTH RUNNING.  The delta
 // filter and the seven branch converters produce output exactly as
 // large as their input.  What they do is make it MORE COMPRESSIBLE for
@@ -82,6 +79,652 @@ pub const XZ_DELTA_DISTANCE_LEAST = 1
 // The largest delta distance: 256.
 pub const XZ_DELTA_DISTANCE_MOST = 256
 
+// A fault naming a filter whose properties are not the ones that filter
+// accepts.
+fn bad_properties(id: Int) -> XzFault
+    xzerror.fault(XzBadFilterProperties(id),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_FILTER))
+
+// A fault naming a filter this package does not implement.
+fn unsupported(id: Int) -> XzFault
+    xzerror.fault(XzUnsupportedFilter(id),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_FILTER))
+
+// A fault naming which of the chain's rules a chain broke.
+fn broken_chain(what: Str) -> XzFault
+    xzerror.fault(XzBadFilterChain(what),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_FILTER))
+
+// A fault naming a parameter outside what a function allows.
+fn bad_parameter(what: Str) -> XzFault
+    xzerror.fault(XzBadParameter(what),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_FILTER))
+
+// The low 32 bits of `n`.
+//
+// Every branch converter is a C loop over `uint32_t` and its arithmetic
+// WRAPS at 32 bits: an absolute address computed past 4 GiB is the low
+// 32 bits of itself, and a decoder subtracting a position from a small
+// relative offset lands on the right answer only because it wraps too.
+// So every arithmetic step in the converters below passes through here,
+// and a step that did not would produce a different answer on a large
+// file.
+fn u32(n: Int) -> Int
+    n & 0xFFFFFFFF
+
+// The byte at `k`, or zero past the end.
+//
+// Every caller below has already bounded its read by the length of the
+// word it is decoding, and the bytes past `n` read as zero rather than
+// needing a branch per byte.
+fn byte_or_zero(b: Bytes, k: Int) -> Int
+    bytes.byte_at(b, k) ?? 0
+
+// The little-endian 32-bit word at `k`.
+fn rd32le(b: Bytes, k: Int) -> Int
+    let low = byte_or_zero(b, k)
+    let mid = byte_or_zero(b, k + 1) << 8
+    let high = byte_or_zero(b, k + 2) << 16
+    u32(low | mid | high | (byte_or_zero(b, k + 3) << 24))
+
+// The big-endian 32-bit word at `k`.
+fn rd32be(b: Bytes, k: Int) -> Int
+    let top = byte_or_zero(b, k) << 24
+    let high = byte_or_zero(b, k + 1) << 16
+    let mid = byte_or_zero(b, k + 2) << 8
+    u32(top | high | mid | byte_or_zero(b, k + 3))
+
+// Write a little-endian 32-bit word at `k`.
+fn wr32le(var b: Bytes, k: Int, v: Int)
+    bytes.set_u8(b, k, v)
+    bytes.set_u8(b, k + 1, u32(v >>> 8))
+    bytes.set_u8(b, k + 2, u32(v >>> 16))
+    bytes.set_u8(b, k + 3, u32(v >>> 24))
+
+// Write a big-endian 32-bit word at `k`.
+fn wr32be(var b: Bytes, k: Int, v: Int)
+    bytes.set_u8(b, k, u32(v >>> 24))
+    bytes.set_u8(b, k + 1, u32(v >>> 16))
+    bytes.set_u8(b, k + 2, u32(v >>> 8))
+    bytes.set_u8(b, k + 3, v)
+
+// Whether a byte is one the x86 converter treats as a sign byte: xz's
+// `Test86MSByte`, which accepts only the two values a sign-extended
+// 32-bit address can end with.
+fn test86_msbyte(b: Int) -> Bool
+    b == '\0' or b == 0xFF
+
+// Whether a previous-mask value permits a conversion: xz's
+// `MASK_TO_ALLOWED_STATUS`, whose one `false` is the mask that means
+// the byte before this one was already a false start.
+fn mask_allowed(m: Int) -> Bool
+    match m & 0x07
+        3 => false
+        5 => false
+        6 => false
+        7 => false
+        _ => true
+
+// Which byte of the four-byte address a previous-mask value points at:
+// xz's `MASK_TO_BIT_NUMBER`.
+fn mask_to_bit(m: Int) -> Int
+    match m
+        // cov: skip — a candidate mask of zero is refused before the walk and the shift never clears every bit
+        0 => 0
+        1 => 1
+        2 => 2
+        // cov: skip — `mask_allowed` refuses a mask of three before `mask_to_bit` is asked
+        3 => 2
+        _ => 3
+
+// The instruction alignment a branch converter works at, or 0 for a
+// filter that is not a converter at all.
+//
+// The one home for the eight alignments: `branch_alignment` publishes
+// it and `is_branch` is "this is not zero".
+fn branch_alignment_of(id: Int) -> Int
+    match id
+        XZ_FILTER_X86      => 1
+        XZ_FILTER_ARMTHUMB => 2
+        XZ_FILTER_RISCV    => 2
+        XZ_FILTER_POWERPC  => 4
+        XZ_FILTER_ARM      => 4
+        XZ_FILTER_SPARC    => 4
+        XZ_FILTER_ARM64    => 4
+        XZ_FILTER_IA64     => 16
+        _                  => 0
+
+// The start offset a converter's properties carry.
+//
+// Four bytes, little-endian, which is the whole of what an `.xz` block
+// header stores for a converter.  Empty properties read as zero — the
+// offset `xz` writes and the one it omits.
+fn branch_start_of(f: XzFilter) -> Int
+    rd32le(f.props, 0)
+
+// The distance a delta filter's properties mean, or 0 when this is not
+// a delta filter or it carries no properties byte.
+//
+// The file's byte is the distance minus one, so zero means a distance
+// of one and an absent byte means there is no distance at all.
+fn delta_dist_of(f: XzFilter) -> Int
+    if f.id != XZ_FILTER_DELTA
+        return 0
+    (bytes.byte_at(f.props, 0) ?? -1) + 1
+
+// The dictionary byte an LZMA2 filter's properties carry, or `-1` when
+// there is none or it is one the format refuses.
+fn lzma2_dict_byte_of(f: XzFilter) -> Int
+    let b = bytes.byte_at(f.props, 0) ?? -1
+    if b < 0 or b > 40
+        return -1
+    b
+
+// How many bytes a dictionary byte means.
+//
+// The format's `(2 | (b & 1)) << (b / 2 + 11)`, except that 40 means
+// 4 GiB minus one rather than the 4 GiB the formula would give — the
+// one value the byte encodes a rule for rather than an expression.
+fn lzma2_dict_bytes(b: Int) -> Int
+    if b == 40
+        return 4294967295
+    (2 | (b & 1)) << (b / 2 + 11)
+
+// Whether a filter's own properties are ones it accepts.
+//
+// A chain is checked by its rules and by this, because a filter whose
+// properties the format refuses is a block header a decoder will
+// refuse, whoever built it.
+//
+// EACH FILTER HAS AN EXACT PROPERTIES LENGTH, and it is not a
+// convention: a delta or LZMA2 filter carries exactly one byte and a
+// branch converter carries zero or four.  A header with a different
+// length is one no encoder writes, so a reader that stopped at the
+// value it wanted would read a malformed file as a legal one — and a
+// converter's four-byte start offset would be read out of three bytes
+// and a zero that is not there.
+fn props_ok(f: XzFilter) -> Bool
+    let n = bytes.len(f.props)
+    if f.id == XZ_FILTER_DELTA
+        if n != 1
+            return false
+        return delta_dist_of(f) > 0
+    if f.id == XZ_FILTER_LZMA2
+        if n != 1
+            return false
+        return lzma2_dict_byte_of(f) >= 0
+    if not is_branch(f.id)
+        // cov: skip — the chain check refuses an id this arm would refuse
+        return false
+    if n != 0 and n != 4
+        return false
+    branch_start_of(f) % branch_alignment_of(f.id) == 0
+
+// The delta filter over `n` bytes of `dst` from `at`.
+//
+// xz keeps a 256-byte ring of history and walks it downward with a
+// counter; over a buffer that ring is exactly "the byte `dist` back",
+// so this is the same transform with the ring left out.  The bytes
+// before `at` are the ring's initial zeroes.
+//
+// THE TWO DIRECTIONS WALK IN OPPOSITE DIRECTIONS.  A decode adds the
+// byte `dist` back AS ALREADY DECODED, so it runs forward; an encode
+// subtracts the byte `dist` back AS STILL ORIGINAL, so it runs
+// backward — which is what xz's ring is for.  A forward encode would
+// subtract a delta from a delta, and the stream would decode to
+// something else.
+fn delta_range(var dst: Bytes, at: Int, n: Int, dist: Int, encode: Bool) -> Bytes
+    if encode
+        var i = n - 1
+        while i >= 0
+            bytes.set_u8(dst, at + i, delta_step(dst, at, i, dist, true))
+            i = i - 1
+    else
+        var i = 0
+        while i < n
+            bytes.set_u8(dst, at + i, delta_step(dst, at, i, dist, false))
+            i = i + 1
+    dst
+
+// One byte of the delta transform: the byte at `at + i` against the
+// byte `dist` back, which reads as zero before the range begins.
+fn delta_step(dst: Bytes, at: Int, i: Int, dist: Int, encode: Bool) -> Int
+    let here = byte_or_zero(dst, at + i)
+    var back = 0
+    if i >= dist
+        back = byte_or_zero(dst, at + i - dist)
+    var value = here + back
+    if encode
+        value = here - back
+    value
+
+// The x86 converter over `n` bytes of `dst` from `at`, whose first byte
+// sits at `now_pos` in the stream.
+//
+// THE ONE CONVERTER THAT CARRIES STATE BETWEEN ITS INSTRUCTIONS.  A
+// relative jump is `E8` or `E9` followed by four bytes, and those four
+// bytes can hold `E8` bytes that are not instructions at all — so xz
+// keeps a mask of where it last looked, refuses a conversion the mask
+// says is a false positive, and, when it accepts one, walks the byte
+// the mask points at until the top byte is one it can store.  On data
+// that is not code at all the mask is what keeps the transform
+// reversible, so both loops are here.
+fn x86_range(var dst: Bytes, at: Int, n: Int, now_pos: Int, encode: Bool) -> Bytes
+    // Five bytes are the conversion's whole span.
+    if n < 5
+        return dst
+    var prev_mask = 0
+    var prev_pos = u32(0 - 1)
+    var pos = 0
+    let limit = n - 5
+    while pos <= limit
+        var b = byte_or_zero(dst, at + pos)
+        if b != 0xE8 and b != 0xE9
+            pos = pos + 1
+        else
+            // How far back the previous candidate was, and the mask it
+            // left behind: a candidate more than five bytes back is
+            // stale and its mask is dropped.
+            let offset = u32(now_pos + pos - prev_pos)
+            prev_pos = u32(now_pos + pos)
+            if offset > 5
+                prev_mask = 0
+            else
+                var k = 0
+                while k < offset
+                    prev_mask = (prev_mask & 0x77) << 1
+                    k = k + 1
+            b = byte_or_zero(dst, at + pos + 4)
+            let allowed = test86_msbyte(b)
+                and mask_allowed(prev_mask >> 1)
+                and (prev_mask >> 1) < 0x10
+            if allowed
+                var src = u32((b << 24)
+                              | (byte_or_zero(dst, at + pos + 3) << 16)
+                              | (byte_or_zero(dst, at + pos + 2) << 8)
+                              | byte_or_zero(dst, at + pos + 1))
+                var dest = 0
+                while true
+                    if encode
+                        dest = u32(src + now_pos + pos + 5)
+                    else
+                        dest = u32(src - (now_pos + pos + 5))
+                    if prev_mask == 0
+                        break
+                    let slot = mask_to_bit(prev_mask >> 1)
+                    b = u32(dest >>> (24 - slot * 8)) & 0xFF
+                    if not test86_msbyte(b)
+                        break
+                    src = u32(dest ^ (u32(1 << (32 - slot * 8)) - 1))
+                // The top byte is stored as 0xFF for a negative address
+                // and 0x00 for a positive one.
+                bytes.set_u8(dst, at + pos + 4, 0 - (u32(dest >>> 24) & 1))
+                bytes.set_u8(dst, at + pos + 3, u32(dest >>> 16))
+                bytes.set_u8(dst, at + pos + 2, u32(dest >>> 8))
+                bytes.set_u8(dst, at + pos + 1, dest)
+                pos = pos + 5
+                prev_mask = 0
+            else
+                pos = pos + 1
+                prev_mask = prev_mask | 1
+                if test86_msbyte(b)
+                    prev_mask = prev_mask | 0x10
+    dst
+
+// The PowerPC converter over `n` bytes of `dst` from `at`.
+//
+// A branch word is `48` in the top six bits, a 24-bit offset, and the
+// absolute and link bits in the two low bits of the LAST byte — which
+// is why the offset is assembled from three bytes and a shifted fourth
+// rather than read as a word.
+fn powerpc_range(var dst: Bytes, at: Int, n: Int, now_pos: Int, encode: Bool) -> Bytes
+    var i = 0
+    while i + 4 <= n
+        let last = byte_or_zero(dst, at + i + 3)
+        if (byte_or_zero(dst, at + i) >> 2) == 0x12 and (last & 3) == 1
+            let src = u32(((byte_or_zero(dst, at + i) & 3) << 24)
+                          | (byte_or_zero(dst, at + i + 1) << 16)
+                          | (byte_or_zero(dst, at + i + 2) << 8)
+                          | (last & 0xFC))
+            var dest = u32(src - (now_pos + i))
+            if encode
+                dest = u32(src + now_pos + i)
+            bytes.set_u8(dst, at + i, 0x48 | (u32(dest >>> 24) & 0x03))
+            bytes.set_u8(dst, at + i + 1, u32(dest >>> 16))
+            bytes.set_u8(dst, at + i + 2, u32(dest >>> 8))
+            bytes.set_u8(dst, at + i + 3, (last & 0x03) | dest)
+        i = i + 4
+    dst
+
+// Which slots of an IA-64 bundle hold branches, by template number:
+// xz's `BRANCH_TABLE`.  Declared here rather than after its user
+// because a private function is resolved where it stands and a public
+// one is hoisted.
+fn ia64_branch_table(template: Int) -> Int
+    match template & 0x1F
+        16 => 4
+        17 => 4
+        18 => 6
+        19 => 6
+        22 => 7
+        23 => 7
+        24 => 4
+        25 => 4
+        28 => 4
+        29 => 4
+        _  => 0
+
+// The IA-64 converter over `n` bytes of `dst` from `at`.
+//
+// AN IA-64 WORD IS THREE 41-BIT SLOTS IN A 16-BYTE BUNDLE, and which
+// slots hold branches is a function of the bundle's template byte.  A
+// slot is found by reading six bytes at a bit offset and shifting the
+// word down onto its low five bits — the one place in this package
+// where a read is not byte-aligned.
+fn ia64_range(var dst: Bytes, at: Int, n: Int, now_pos: Int, encode: Bool) -> Bytes
+    var i = 0
+    while i + 16 <= n
+        let mask = ia64_branch_table(byte_or_zero(dst, at + i) & 0x1F)
+        var bit_pos = 5
+        var slot = 0
+        while slot < 3
+            if ((mask >> slot) & 1) != 0
+                let byte_pos = bit_pos >> 3
+                let bit_res = bit_pos & 0x7
+                var instruction = 0
+                var j = 0
+                while j < 6
+                    instruction = (byte_or_zero(dst, at + i + j + byte_pos) << (8 * j))
+                        | instruction
+                    j = j + 1
+                var norm = instruction >>> bit_res
+                if ((norm >>> 37) & 0xF) == 0x5 and ((norm >>> 9) & 0x7) == 0
+                    // The 20-bit slot offset, with one bit of it out at
+                    // bit 36, scaled by the bundle's four-byte words.
+                    var src = ((norm >>> 13) & 0xFFFFF) | (((norm >>> 36) & 1) << 20)
+                    src = u32(src << 4)
+                    var dest = u32(src - (now_pos + i))
+                    if encode
+                        dest = u32(now_pos + i + src)
+                    dest = u32(dest >>> 4)
+                    norm = norm & ~(0x8FFFFF << 13)
+                    norm = norm | ((dest & 0xFFFFF) << 13)
+                    norm = norm | ((dest & 0x100000) << 16)
+                    instruction = instruction & ((1 << bit_res) - 1)
+                    instruction = instruction | (norm << bit_res)
+                    var k = 0
+                    while k < 6
+                        bytes.set_u8(dst, at + i + k + byte_pos,
+                                     instruction >>> (8 * k))
+                        k = k + 1
+            bit_pos = bit_pos + 41
+            slot = slot + 1
+        i = i + 16
+    dst
+
+// The ARM converter over `n` bytes of `dst` from `at`.
+//
+// An ARM branch is a word whose top byte is `EB`, and its 24-bit
+// offset counts four-byte instructions from the instruction after it —
+// the `+ 8` below.
+fn arm_range(var dst: Bytes, at: Int, n: Int, now_pos: Int, encode: Bool) -> Bytes
+    var i = 0
+    while i + 4 <= n
+        if byte_or_zero(dst, at + i + 3) == 0xEB
+            var src = u32((byte_or_zero(dst, at + i + 2) << 16)
+                          | (byte_or_zero(dst, at + i + 1) << 8)
+                          | byte_or_zero(dst, at + i))
+            src = u32(src << 2)
+            var dest = u32(src - (now_pos + i + 8))
+            if encode
+                dest = u32(now_pos + i + 8 + src)
+            dest = u32(dest >>> 2)
+            bytes.set_u8(dst, at + i + 2, u32(dest >>> 16))
+            bytes.set_u8(dst, at + i + 1, u32(dest >>> 8))
+            bytes.set_u8(dst, at + i, dest)
+        i = i + 4
+    dst
+
+// The ARM-Thumb converter over `n` bytes of `dst` from `at`.
+//
+// Thumb branches are TWO 16-bit halves with the offset split across
+// them, so the converter steps two bytes at a time and skips the
+// second half of a branch it converted.
+fn armthumb_range(var dst: Bytes, at: Int, n: Int, now_pos: Int, encode: Bool) -> Bytes
+    var i = 0
+    while i + 4 <= n
+        let first = byte_or_zero(dst, at + i + 1)
+        let second = byte_or_zero(dst, at + i + 3)
+        if (first & 0xF8) == 0xF0 and (second & 0xF8) == 0xF8
+            var src = u32(((first & 7) << 19)
+                          | (byte_or_zero(dst, at + i) << 11)
+                          | ((second & 7) << 8)
+                          | byte_or_zero(dst, at + i + 2))
+            src = u32(src << 1)
+            var dest = u32(src - (now_pos + i + 4))
+            if encode
+                dest = u32(now_pos + i + 4 + src)
+            dest = u32(dest >>> 1)
+            bytes.set_u8(dst, at + i + 1, 0xF0 | (u32(dest >>> 19) & 0x7))
+            bytes.set_u8(dst, at + i, u32(dest >>> 11))
+            bytes.set_u8(dst, at + i + 3, 0xF8 | (u32(dest >>> 8) & 0x7))
+            bytes.set_u8(dst, at + i + 2, dest)
+            // The second half was consumed as part of the branch.
+            i = i + 2
+        i = i + 2
+    dst
+
+// The SPARC converter over `n` bytes of `dst` from `at`.
+//
+// Two opcodes carry a call or a branch, and the offset is a 22-bit
+// field in the middle of the word: the top two bits are the
+// instruction's own and go back untouched.
+fn sparc_range(var dst: Bytes, at: Int, n: Int, now_pos: Int, encode: Bool) -> Bytes
+    var i = 0
+    while i + 4 <= n
+        let top = byte_or_zero(dst, at + i)
+        let next = byte_or_zero(dst, at + i + 1)
+        let is_call = top == '@' and (next & 0xC0) == '\0'
+        let is_branch = top == 0x7F and (next & 0xC0) == 0xC0
+        if is_call or is_branch
+            var src = u32((top << 24) | (next << 16)
+                          | (byte_or_zero(dst, at + i + 2) << 8)
+                          | byte_or_zero(dst, at + i + 3))
+            src = u32(src << 2)
+            var dest = u32(src - (now_pos + i))
+            if encode
+                dest = u32(now_pos + i + src)
+            dest = u32(dest >>> 2)
+            let sign = u32((0 - ((dest >>> 22) & 1)) << 22) & 0x3FFFFFFF
+            dest = u32(sign | (dest & 0x3FFFFF) | 0x40000000)
+            bytes.set_u8(dst, at + i, u32(dest >>> 24))
+            bytes.set_u8(dst, at + i + 1, u32(dest >>> 16))
+            bytes.set_u8(dst, at + i + 2, u32(dest >>> 8))
+            bytes.set_u8(dst, at + i + 3, dest)
+        i = i + 4
+    dst
+
+// The ARM64 converter over `n` bytes of `dst` from `at`.
+//
+// TWO INSTRUCTIONS, TWO RANGES.  `BL` carries a 26-bit offset and the
+// whole of it is converted.  `ADRP` carries a page number in 21 bits
+// and is converted ONLY within +/-512 MiB of the position, because past
+// that the immediate is no more likely to be an address than a chance
+// byte sequence, and a false conversion costs more than the match it
+// finds.  The test is one addition, and the immediate is stored back in
+// the two pieces the instruction keeps it in.
+fn arm64_range(var dst: Bytes, at: Int, n: Int, now_pos: Int, encode: Bool) -> Bytes
+    var i = 0
+    while i + 4 <= n
+        let instr = rd32le(dst, at + i)
+        let pc = u32(now_pos + i)
+        if (instr >>> 26) == '%'
+            let src = instr
+            var dest = u32(src - (pc >>> 2))
+            if encode
+                dest = u32(src + (pc >>> 2))
+            wr32le(var dst, at + i, 0x94000000 | (dest & 0x03FFFFFF))
+        else
+            if (instr & 0x9F000000) == 0x90000000
+                let src = u32(((instr >>> 29) & 3) | ((instr >>> 3) & 0x001FFFFC))
+                let out_of_range = ((src + 0x00020000) & 0x001C0000) != 0
+                if not out_of_range
+                    let kept = instr & 0x9000001F
+                    var dest = u32(src - (pc >>> 12))
+                    if encode
+                        dest = u32(src + (pc >>> 12))
+                    let page = (dest & 3) << 29
+                    let imm = (dest & 0x0003FFFC) << 3
+                    let sign = u32(0 - (dest & 0x00020000)) & 0x00E00000
+                    wr32le(var dst, at + i, u32(kept | page | imm | sign))
+        i = i + 4
+    dst
+
+// The RISC-V converter over `n` bytes of `dst` from `at`.
+//
+// THREE ENCODINGS IN ONE ARCHITECTURE.  A `JAL` is converted only when
+// its destination is `x1` or `x5` — a call, not a local jump — and its
+// 20-bit immediate is stored in a rotated order because that puts the
+// bytes that differ between two nearby addresses at the end.  An
+// `AUIPC` is converted only as a PAIR with the instruction after it,
+// because its immediate holds a multiple of 4 KiB and it is the second
+// instruction that carries the rest; the pair is rewritten into a
+// form no compiler emits, with the pair's address stored as a
+// big-endian word in the second instruction's place.  And because that
+// form is just bytes, an input that already contains it must convert
+// the OTHER way — so both branches below have an inverse, and the two
+// of them are what make this filter reversible on arbitrary data.
+//
+// A PAIR AT THE END OF THE RANGE IS NOT CONVERTED: the loop stops eight
+// bytes short, which is xz's own bound and the reason a two-byte
+// instruction stream can still be filtered.
+fn riscv_range(var dst: Bytes, at: Int, n: Int, now_pos: Int, encode: Bool) -> Bytes
+    if n < 8
+        return dst
+    let size = n - 8
+    var i = 0
+    while i <= size
+        let first = byte_or_zero(dst, at + i)
+        if first == 0xEF
+            let second = byte_or_zero(dst, at + i + 1)
+            if (second & 0x0D) == 0
+                let b2 = byte_or_zero(dst, at + i + 2)
+                let b3 = byte_or_zero(dst, at + i + 3)
+                if encode
+                    var src = u32(((second & 0xF0) << 8)
+                                  | ((b2 & 0x0F) << 16)
+                                  | ((b2 & 0x10) << 7)
+                                  | ((b2 & 0xE0) >> 4)
+                                  | ((b3 & 0x7F) << 4)
+                                  | ((b3 & 0x80) << 13))
+                    src = u32(src + now_pos + i)
+                    bytes.set_u8(dst, at + i + 1,
+                                 (second & 0x0F) | (u32(src >>> 13) & 0xF0))
+                    bytes.set_u8(dst, at + i + 2, u32(src >>> 9))
+                    bytes.set_u8(dst, at + i + 3, u32(src >>> 1))
+                else
+                    var src = ((second & 0xF0) << 13) | (b2 << 9) | (b3 << 1)
+                    src = u32(src - (now_pos + i))
+                    bytes.set_u8(dst, at + i + 1,
+                                 (second & 0x0F) | (u32(src >>> 8) & 0xF0))
+                    let mid = (u32(src >>> 16) & 0x0F)
+                        | (u32(src >>> 7) & 0x10)
+                        | (u32(src << 4) & 0xE0)
+                    bytes.set_u8(dst, at + i + 2, mid)
+                    let last = (u32(src >>> 4) & 0x7F) | (u32(src >>> 13) & 0x80)
+                    bytes.set_u8(dst, at + i + 3, last)
+                i = i + 4
+            else
+                i = i + 2
+        else
+            if (first & 0x7F) == 0x17
+                let word = rd32le(dst, at + i)
+                let pair = rd32le(dst, at + i + 4)
+                if (word & 0xE80) != 0
+                    // A pair, whose two registers must agree and whose
+                    // second instruction must be a 32-bit one.
+                    let unmatched = (u32(word << 8) ^ u32(pair - 3)) & 0xF8003
+                    if unmatched != 0
+                        i = i + 6
+                    else
+                        if encode
+                            var addr = (word & 0xFFFFF000) + (pair >>> 20)
+                            addr = addr - ((pair >>> 19) & 0x1000)
+                            addr = u32(addr + now_pos + i)
+                            wr32le(var dst, at + i, 0x17 | (2 << 7) | u32(pair << 12))
+                            wr32be(var dst, at + i + 4, addr)
+                        else
+                            let addr = u32((word & 0xFFFFF000) + (pair >>> 20))
+                            wr32le(var dst, at + i, 0x17 | (2 << 7) | u32(pair << 12))
+                            wr32le(var dst, at + i + 4, addr)
+                        i = i + 8
+                else
+                    // A pair in the converted form, or bytes that look
+                    // like one.
+                    let rs1 = word >>> 27
+                    let special = u32(u32(word - 0x3117) << 18) < (rs1 & 0x1D)
+                    if not special
+                        i = i + 4
+                    else
+                        let stored = rd32le(dst, at + i + 4)
+                        if encode
+                            let moved = (word >>> 12) | u32(stored << 20)
+                            wr32le(var dst, at + i,
+                                   0x17 | (rs1 << 7) | (stored & 0xFFFFF000))
+                            wr32le(var dst, at + i + 4, u32(moved))
+                        else
+                            let addr = u32(rd32be(dst, at + i + 4) - (now_pos + i))
+                            let restored = u32((word >>> 12) | u32(addr << 20))
+                            let upper = u32((addr + 0x800) & 0xFFFFF000)
+                            wr32le(var dst, at + i, 0x17 | (rs1 << 7) | upper)
+                            wr32le(var dst, at + i + 4, restored)
+                        i = i + 8
+            else
+                i = i + 2
+    dst
+
+// One filter's transform, dispatched by ID.
+//
+// The three refusals are the three things that make a filter not this
+// call's business: a compression filter, which `xzlzma2` decodes; a
+// filter ID nothing here implements; and a range that is not inside the
+// buffer.  A filter whose own properties are bad is a fourth, and it is
+// refused by the same accessor a caller reads them with.
+//
+// `start + at` is what makes the converters position-dependent: the
+// offset a converted branch ends up holding is an address in the
+// stream, and the address of the filter's first byte is the block
+// header's start offset plus however far into the buffer this run
+// begins.
+fn apply_range(f: XzFilter, var dst: Bytes, at: Int, n: Int,
+               encode: Bool) -> Result<Bytes, XzFault> []
+    let where = xzerror.here(-1, at, xzerror.XZ_LAYER_FILTER)
+    if at < 0 or n < 0 or at + n > bytes.len(dst)
+        return Err(xzerror.fault(XzBufferTooSmall(at + n, bytes.len(dst)), where))
+    if is_compression(f.id)
+        return Err(unsupported(f.id))
+    if f.id == XZ_FILTER_DELTA
+        let dist = delta_dist_of(f)
+        if dist == 0
+            return Err(bad_properties(f.id))
+        return Ok(delta_range(var dst, at, n, dist, encode))
+    let align = branch_alignment_of(f.id)
+    if align == 0
+        return Err(unsupported(f.id))
+    let start = branch_start_of(f)
+    if start % align != 0
+        return Err(bad_properties(f.id))
+    let out = match f.id
+        XZ_FILTER_X86      => x86_range(var dst, at, n, start + at, encode)
+        XZ_FILTER_POWERPC  => powerpc_range(var dst, at, n, start + at, encode)
+        XZ_FILTER_IA64     => ia64_range(var dst, at, n, start + at, encode)
+        XZ_FILTER_ARM      => arm_range(var dst, at, n, start + at, encode)
+        XZ_FILTER_ARMTHUMB => armthumb_range(var dst, at, n, start + at, encode)
+        XZ_FILTER_SPARC    => sparc_range(var dst, at, n, start + at, encode)
+        XZ_FILTER_ARM64    => arm64_range(var dst, at, n, start + at, encode)
+        _                  => riscv_range(var dst, at, n, start + at, encode)
+    Ok(out)
+
 // One filter in a chain: its ID and its properties.
 //
 // Properties are kept as the bytes the file carries rather than as a
@@ -126,7 +769,11 @@ pub struct XzFilter
 //         Err(e) => println(e.message())
 // ```
 pub fn delta(n: Int) -> Result<XzFilter, XzFault> []
-    todo("xz-nv.xzfilter.delta")
+    if n < XZ_DELTA_DISTANCE_LEAST or n > XZ_DELTA_DISTANCE_MOST
+        return Err(bad_properties(XZ_FILTER_DELTA))
+    var props = bytes.zeros(1)
+    bytes.set_u8(props, 0, n - 1)
+    Ok(XzFilter { id: XZ_FILTER_DELTA, props: props })
 
 // The distance a delta filter was built with.
 //
@@ -144,7 +791,10 @@ pub fn delta(n: Int) -> Result<XzFilter, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn delta_distance(f: XzFilter) -> Result<Int, XzFault> []
-    todo("xz-nv.xzfilter.delta_distance")
+    let dist = delta_dist_of(f)
+    if dist == 0
+        return Err(bad_properties(f.id))
+    Ok(dist)
 
 // A branch converter for an architecture, with a start offset.
 //
@@ -166,7 +816,18 @@ pub fn delta_distance(f: XzFilter) -> Result<Int, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn branch(id: Int, start_offset: Int) -> Result<XzFilter, XzFault> []
-    todo("xz-nv.xzfilter.branch")
+    let align = branch_alignment_of(id)
+    if align == 0
+        return Err(unsupported(id))
+    if start_offset < 0 or start_offset > 0xFFFFFFFF or start_offset % align != 0
+        return Err(bad_properties(id))
+    // A start offset of zero is the field left out, which is what `xz`
+    // writes and four zero bytes would say again.
+    if start_offset == 0
+        return Ok(XzFilter { id: id, props: bytes.zeros(0) })
+    var props = bytes.zeros(4)
+    wr32le(var props, 0, start_offset)
+    Ok(XzFilter { id: id, props: props })
 
 // The instruction alignment a branch converter works at, in bytes.
 //
@@ -186,7 +847,10 @@ pub fn branch(id: Int, start_offset: Int) -> Result<XzFilter, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn branch_alignment(id: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzfilter.branch_alignment")
+    let align = branch_alignment_of(id)
+    if align == 0
+        return Err(unsupported(id))
+    Ok(align)
 
 // The start offset a branch converter was built with, or 0.
 //
@@ -199,7 +863,9 @@ pub fn branch_alignment(id: Int) -> Result<Int, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn branch_start(f: XzFilter) -> Result<Int, XzFault> []
-    todo("xz-nv.xzfilter.branch_start")
+    if not is_branch(f.id)
+        return Err(unsupported(f.id))
+    Ok(branch_start_of(f))
 
 // An LZMA2 filter with a dictionary size, in bytes.
 //
@@ -219,7 +885,13 @@ pub fn branch_start(f: XzFilter) -> Result<Int, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn lzma2(dict_byte: Int) -> Result<XzFilter, XzFault> []
-    todo("xz-nv.xzfilter.lzma2")
+    // 40 is the format's ceiling; above it the byte is one
+    // `lzma2_dictionary_bytes` refuses and nothing decodes.
+    if dict_byte < 0 or dict_byte > 40
+        return Err(bad_properties(XZ_FILTER_LZMA2))
+    var props = bytes.zeros(1)
+    bytes.set_u8(props, 0, dict_byte)
+    Ok(XzFilter { id: XZ_FILTER_LZMA2, props: props })
 
 // The dictionary size a dictionary byte means, in bytes.
 //
@@ -237,7 +909,9 @@ pub fn lzma2(dict_byte: Int) -> Result<XzFilter, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn lzma2_dictionary_bytes(dict_byte: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzfilter.lzma2_dictionary_bytes")
+    if dict_byte < 0 or dict_byte > 40
+        return Err(bad_properties(XZ_FILTER_LZMA2))
+    Ok(lzma2_dict_bytes(dict_byte))
 
 // The smallest dictionary byte whose size is at least `n` bytes.
 //
@@ -253,7 +927,16 @@ pub fn lzma2_dictionary_bytes(dict_byte: Int) -> Result<Int, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn lzma2_dictionary_byte_for(n: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzfilter.lzma2_dictionary_byte_for")
+    if n < 0
+        return Err(bad_parameter("lzma2_dictionary_byte_for: a negative size"))
+    // Nothing above the ceiling's own size is expressible, so a caller
+    // asking for one is asking for a byte the format does not have.
+    if n > 4294967295
+        return Err(bad_properties(XZ_FILTER_LZMA2))
+    var b = 0
+    while b < 40 and lzma2_dict_bytes(b) < n
+        b = b + 1
+    Ok(b)
 
 // Whether a filter ID names a compression filter.
 //
@@ -267,7 +950,7 @@ pub fn lzma2_dictionary_byte_for(n: Int) -> Result<Int, XzFault> []
 //     println("${xzfilter.is_compression(xzfilter.XZ_FILTER_LZMA2)}")
 // ```
 pub fn is_compression(id: Int) -> Bool []
-    todo("xz-nv.xzfilter.is_compression")
+    id == XZ_FILTER_LZMA2 or id == XZ_FILTER_LZMA1
 
 // Whether a filter ID names one of the eight branch converters.
 //
@@ -278,7 +961,7 @@ pub fn is_compression(id: Int) -> Bool []
 //     println("${xzfilter.is_branch(xzfilter.XZ_FILTER_RISCV)}")
 // ```
 pub fn is_branch(id: Int) -> Bool []
-    todo("xz-nv.xzfilter.is_branch")
+    branch_alignment_of(id) != 0
 
 // A short, stable name for a filter ID: `"delta"`, `"x86"`,
 // `"lzma2"`, or `"unknown-<id>"`.
@@ -290,7 +973,19 @@ pub fn is_branch(id: Int) -> Bool []
 //     println(xzfilter.name_of(xzfilter.XZ_FILTER_ARMTHUMB))
 // ```
 pub fn name_of(id: Int) -> Str []
-    todo("xz-nv.xzfilter.name_of")
+    match id
+        XZ_FILTER_DELTA    => "delta"
+        XZ_FILTER_X86      => "x86"
+        XZ_FILTER_POWERPC  => "powerpc"
+        XZ_FILTER_IA64     => "ia64"
+        XZ_FILTER_ARM      => "arm"
+        XZ_FILTER_ARMTHUMB => "armthumb"
+        XZ_FILTER_SPARC    => "sparc"
+        XZ_FILTER_ARM64    => "arm64"
+        XZ_FILTER_RISCV    => "riscv"
+        XZ_FILTER_LZMA2    => "lzma2"
+        XZ_FILTER_LZMA1    => "lzma1"
+        _                  => "unknown-${id}"
 
 // Check a chain against all four of the format's rules at once.
 //
@@ -312,7 +1007,39 @@ pub fn name_of(id: Int) -> Str []
 //         Err(e) => println(e.message())
 // ```
 pub fn check_chain(filters: [XzFilter]) -> Result<Int, XzFault> []
-    todo("xz-nv.xzfilter.check_chain")
+    // Four, which is `xzblock.XZ_FILTERS_MOST`: the block-header module
+    // imports this one, so the number is named in both rather than
+    // shared, and the two are asserted equal by a test.
+    let most = 4
+    let count = list.len(filters)
+    if count > most
+        return Err(broken_chain("more than four filters"))
+    var compression = 0
+    var last = -1
+    var seen: [Int] = []
+    var i = 0
+    for f in filters
+        // LZMA1 has no end marker of its own, so an `.xz` block —
+        // which needs one — cannot carry it.  Legal in a raw stream.
+        if f.id == XZ_FILTER_LZMA1
+            return Err(broken_chain("lzma1 cannot signal its own end"))
+        if not is_compression(f.id) and f.id != XZ_FILTER_DELTA and not is_branch(f.id)
+            return Err(unsupported(f.id))
+        if not props_ok(f)
+            return Err(bad_properties(f.id))
+        if is_compression(f.id)
+            compression = compression + 1
+            last = i
+        if is_branch(f.id)
+            if list.contains(seen, f.id)
+                return Err(broken_chain("a branch converter appears twice"))
+            seen = list.push(seen, f.id)
+        i = i + 1
+    if compression != 1
+        return Err(broken_chain("a chain needs exactly one compression filter"))
+    if last != count - 1
+        return Err(broken_chain("the compression filter must be last"))
+    Ok(count)
 
 // Apply a non-compression filter's decode direction in place, over `n`
 // bytes of `dst` from `at`.
@@ -337,8 +1064,8 @@ pub fn check_chain(filters: [XzFilter]) -> Result<Int, XzFault> []
 //                 Err(e) => println(e.message())
 //         Err(e) => println(e.message())
 // ```
-pub fn decode_in_place(f: XzFilter, dst: Bytes, at: Int, n: Int) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzfilter.decode_in_place")
+pub fn decode_in_place(f: XzFilter, var dst: Bytes, at: Int, n: Int) -> Result<Bytes, XzFault> []
+    apply_range(f, var dst, at, n, false)
 
 // Apply a non-compression filter's encode direction in place.
 //
@@ -358,5 +1085,5 @@ pub fn decode_in_place(f: XzFilter, dst: Bytes, at: Int, n: Int) -> Result<Bytes
 //                 Err(e) => println(e.message())
 //         Err(e) => println(e.message())
 // ```
-pub fn encode_in_place(f: XzFilter, dst: Bytes, at: Int, n: Int) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzfilter.encode_in_place")
+pub fn encode_in_place(f: XzFilter, var dst: Bytes, at: Int, n: Int) -> Result<Bytes, XzFault> []
+    apply_range(f, var dst, at, n, true)

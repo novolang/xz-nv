@@ -1,9 +1,6 @@
 // xzlzma2.nv — the chunk layer that makes LZMA restartable, resettable
 // and able to hold data it could not compress.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHY LZMA2 EXISTS AT ALL.  LZMA1 is one range-coded stream from the
 // first byte to the last.  Three things follow from that and all three
 // are problems.  It cannot store incompressible data without making it
@@ -31,9 +28,96 @@
 // `.xz`'s per-block independence — the thing `pixz` is built on — would
 // not hold.  `XzLzma2NoDictionaryReset` is the refusal, and it is
 // checked at the first chunk rather than discovered at the first match.
+//
+// THE TWO THINGS A CHUNK CARRIES INTO THE NEXT ONE are the state
+// machine's position and the four remembered match distances, and they
+// are fields of `XzLzma2State` for exactly that reason.  A chunk whose
+// control byte resets the state starts them over; a chunk whose control
+// byte resets nothing continues with the previous chunk's — which is
+// what makes it worth splitting an LZMA stream into chunks that do not
+// all reset.  The four distances are also why a chunk's own properties
+// matter: a literal after a match is coded against the byte the current
+// distance points at.
 
 use xzerror
 use xzlzma
+use xzrange
+
+// One byte of a source, or zero past its end: every caller below has
+// already bounded what it reads.
+fn byte_of(src: Bytes, k: Int) -> Int
+    bytes.byte_at(src, k) ?? 0
+
+// A control byte the format does not define, or a chunk that asked for
+// a state reset before any properties had been given.
+fn bad_chunk(control: Int, at: Int) -> XzFault
+    xzerror.fault(XzBadLzma2Chunk(control),
+                  xzerror.here(-1, at, xzerror.XZ_LAYER_LZMA2))
+
+// A chunk that referred to the dictionary before it had been reset.
+fn no_dictionary_reset(at: Int) -> XzFault
+    xzerror.fault(XzLzma2NoDictionaryReset,
+                  xzerror.here(-1, at, xzerror.XZ_LAYER_LZMA2))
+
+// Not enough source bytes to finish what was started.
+fn truncated(need: Int, at: Int) -> XzFault
+    xzerror.fault(XzTruncated(need),
+                  xzerror.here(-1, at, xzerror.XZ_LAYER_LZMA2))
+
+// A caller's dictionary or probability array was too small.
+fn buffer_too_small(want: Int, have: Int) -> XzFault
+    xzerror.fault(XzBufferTooSmall(want, have),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA2))
+
+// A chunk's sizes and the bytes in it disagree.
+fn size_mismatch(declared: Int, actual: Int, at: Int) -> XzFault
+    xzerror.fault(XzSizeMismatch(declared, actual),
+                  xzerror.here(-1, at, xzerror.XZ_LAYER_LZMA2))
+
+// A range coder that ran out of bytes, or started on a non-zero one.
+fn bad_range(at: Int) -> XzFault
+    xzerror.fault(XzBadRangeCoder(at),
+                  xzerror.here(-1, at, xzerror.XZ_LAYER_LZMA2))
+
+// A distance that reached past the bytes produced so far.
+fn distance_too_far(distance: Int, available: Int) -> XzFault
+    xzerror.fault(XzDistanceTooFar(distance, available),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA2))
+
+// A caller's parameter was outside the range the function documents.
+fn bad_parameter(what: Str) -> XzFault
+    xzerror.fault(XzBadParameter(what),
+                  xzerror.here(-1, -1, xzerror.XZ_LAYER_LZMA2))
+
+// The parameters an LZMA2 stream that names none uses.
+//
+// The `.lzma` container always names its three, but a decoder has to
+// size its probability array before the first chunk arrives and the
+// chunk that would name them has not been read yet.  `decoder` checks
+// the array against this model; `decode_chunk` re-checks it against
+// the one the chunk turns out to carry.
+fn default_properties() -> XzLzmaProps
+    XzLzmaProps {
+        lc: xzlzma.XZ_LC_DEFAULT,
+        lp: xzlzma.XZ_LP_DEFAULT,
+        pb: xzlzma.XZ_PB_DEFAULT }
+
+// A compressed chunk, with the header length its reset code implies.
+fn compressed_chunk(reset: Int, u: Int, cs: Int, props: ?Int) -> XzLzma2Chunk
+    var h = 5
+    if carries_properties(reset)
+        // Two of the four reset codes read a properties byte after the
+        // two sizes, and the two that do are the two that could change
+        // the model's shape.
+        h = 6
+    XzLzma2Chunk {
+        is_end: false,
+        is_uncompressed: false,
+        reset: reset,
+        uncompressed_size: u,
+        compressed_size: cs,
+        header_bytes: h,
+        props_byte: props }
 
 // The control byte that ends an LZMA2 stream: `0x00`.
 pub const XZ_LZMA2_END = 0x00
@@ -100,6 +184,12 @@ pub struct XzLzma2Chunk
     // marker, 3 for an uncompressed chunk, 5 or 6 for a compressed
     // one depending on whether it carries a properties byte.
     header_bytes: Int
+    // The properties byte the header carried, or `None` for a chunk
+    // whose reset code does not call for one.  Kept because a header
+    // has to be writeable to be read back: `chunk_header_bytes` has no
+    // other way to place the byte, and the encoder release needs to
+    // write exactly the header a decoder would accept.
+    props_byte: ?Int
 
 // What a control byte means, before its size bytes have been read.
 //
@@ -118,7 +208,45 @@ pub struct XzLzma2Chunk
 //         Err(e) => println(e.message())
 // ```
 pub fn read_control(control: Int) -> Result<XzLzma2Chunk, XzFault> []
-    todo("xz-nv.xzlzma2.read_control")
+    if control < XZ_LZMA2_END or control > 0xFF
+        return Err(bad_chunk(control, 0))
+    if control == XZ_LZMA2_END
+        // The end marker is not a chunk of either kind: it has no
+        // payload, no size and no reset.  Its header is the one byte
+        // that said so.
+        return Ok(XzLzma2Chunk {
+            is_end: true,
+            is_uncompressed: false,
+            reset: XZ_LZMA2_RESET_NONE,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            header_bytes: 1,
+            props_byte: None })
+    if control <= XZ_LZMA2_UNCOMPRESSED_CONTINUE
+        var reset = XZ_LZMA2_RESET_NONE
+        if control == XZ_LZMA2_UNCOMPRESSED_RESET
+            // Only the first of the two resets the dictionary, and it
+            // is also the one that says the next compressed chunk must
+            // bring properties of its own.
+            reset = XZ_LZMA2_RESET_DICT
+        return Ok(XzLzma2Chunk {
+            is_end: false,
+            is_uncompressed: true,
+            reset: reset,
+            // The sizes follow in the two bytes after the control one.
+            uncompressed_size: 0,
+            compressed_size: 0,
+            header_bytes: 3,
+            props_byte: None })
+    if control < XZ_LZMA2_COMPRESSED_LEAST
+        // The gap between the two uncompressed controls and the
+        // compressed range: `0x03` to `0x7F`, which the format leaves
+        // undefined and a damaged stream lands on.
+        return Err(bad_chunk(control, 0))
+    // The low five bits are the HIGH bits of the uncompressed size;
+    // the two bytes after the control byte are the rest.  Everything
+    // about the size is filled in by `read_chunk`, which has them.
+    Ok(compressed_chunk((control >> 5) & 3, (control & 0x1F) << 16, 0, None))
 
 // Read a whole chunk header from `src` at `off`.
 //
@@ -136,7 +264,47 @@ pub fn read_control(control: Int) -> Result<XzLzma2Chunk, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn read_chunk(src: Bytes, off: Int) -> Result<XzLzma2Chunk, XzFault> []
-    todo("xz-nv.xzlzma2.read_chunk")
+    if off < 0 or bytes.len(src) - off < 1
+        return Err(truncated(1, off))
+    let control = byte_of(src, off)
+    match read_control(control)
+        Err(f) => Err(f)
+        Ok(c)  =>
+            let have = bytes.len(src) - off
+            if c.is_end
+                return Ok(c)
+            if have < c.header_bytes
+                return Err(truncated(c.header_bytes - have, off))
+            if c.is_uncompressed
+                // ONE size, not two, and it is the number of bytes the
+                // chunk occupies — which is what it produces, because
+                // the bytes are stored as they are.  This is the
+                // header an encoder writes for data LZMA would have
+                // expanded, and it is three bytes where a compressed
+                // chunk's is five.
+                let n = ((byte_of(src, off + 1) << 8) | byte_of(src, off + 2)) + 1
+                return Ok(XzLzma2Chunk {
+                    is_end: false,
+                    is_uncompressed: true,
+                    reset: c.reset,
+                    uncompressed_size: n,
+                    compressed_size: n,
+                    header_bytes: 3,
+                    props_byte: None })
+            // A compressed chunk: the control byte's five low bits are
+            // the top of the uncompressed size, the next two bytes the
+            // bottom of it, the two after those the compressed size.
+            // Both sizes are minus one, which is how a 65536-byte
+            // chunk fits in two bytes.
+            let u = c.uncompressed_size
+                + ((byte_of(src, off + 1) << 8) | byte_of(src, off + 2)) + 1
+            let cs = ((byte_of(src, off + 3) << 8) | byte_of(src, off + 4)) + 1
+            if carries_properties(c.reset)
+                // The last byte of the header, and the reason the
+                // header is six bytes rather than five.
+                Ok(compressed_chunk(c.reset, u, cs, Some(byte_of(src, off + 5))))
+            else
+                Ok(compressed_chunk(c.reset, u, cs, None))
 
 // Which reset a control byte performs.
 //
@@ -151,7 +319,11 @@ pub fn read_chunk(src: Bytes, off: Int) -> Result<XzLzma2Chunk, XzFault> []
 //         Err(e) => println(e.message())
 // ```
 pub fn reset_of(control: Int) -> Result<Int, XzFault> []
-    todo("xz-nv.xzlzma2.reset_of")
+    if control < XZ_LZMA2_COMPRESSED_LEAST or control > 0xFF
+        return Err(bad_chunk(control, 0))
+    // Bits 5 and 6, which is where the four codes live: `0x80` and up
+    // are four blocks of thirty-two, and the block number is the reset.
+    Ok((control >> 5) & 3)
 
 // Whether a chunk carries a properties byte.
 //
@@ -169,7 +341,11 @@ pub fn reset_of(control: Int) -> Result<Int, XzFault> []
 //     println("${xzlzma2.carries_properties(xzlzma2.XZ_LZMA2_RESET_DICT)}")
 // ```
 pub fn carries_properties(reset: Int) -> Bool []
-    todo("xz-nv.xzlzma2.carries_properties")
+    // The two upper codes: a chunk that reads new properties has to
+    // reset the state too, because the model it was running under is
+    // about to be replaced and the literal coders selected by `lc` and
+    // `lp` would no longer be the ones it was using.
+    reset == XZ_LZMA2_RESET_PROPS or reset == XZ_LZMA2_RESET_DICT
 
 // Whether a chunk resets the dictionary.
 //
@@ -184,7 +360,10 @@ pub fn carries_properties(reset: Int) -> Bool []
 //     println("${xzlzma2.resets_dictionary(xzlzma2.XZ_LZMA2_RESET_DICT)}")
 // ```
 pub fn resets_dictionary(reset: Int) -> Bool []
-    todo("xz-nv.xzlzma2.resets_dictionary")
+    // The uppermost code alone, and the reason the control byte has
+    // four codes rather than three: a block that could inherit a
+    // dictionary could not be decoded without the block before it.
+    reset == XZ_LZMA2_RESET_DICT
 
 // An LZMA2 decoder between chunks.
 //
@@ -203,6 +382,12 @@ pub struct XzLzma2State
     props: ?XzLzmaProps
     // Whether the dictionary has been reset since the block started.
     dict_reset: Bool
+    // The state machine's position, which a chunk that does not reset
+    // the state carries into the next one.  `0` is the state a reset
+    // leaves it in.
+    state: Int
+    // The four remembered match distances, carried the same way.
+    reps: XzRepDistances
     // How many bytes have been produced into the caller's dictionary
     // buffer.
     produced: Int
@@ -210,9 +395,11 @@ pub struct XzLzma2State
     consumed: Int
     // The caller's dictionary — which is also the output buffer,
     // because an LZMA match reads from the bytes already produced.
-    dict: Bytes
-    // The caller's probability array.
-    probs: Bytes
+    // `var`, because a chunk writes into it; the buffer is still the
+    // caller's, and the decoder never allocates one.
+    var dict: Bytes
+    // The caller's probability array, `var` for the same reason.
+    var probs: Bytes
 
 // An LZMA2 decoder over a caller's dictionary and probability array.
 //
@@ -235,8 +422,33 @@ pub struct XzLzma2State
 //         Ok(d)  => println("${xzlzma2.consumed_of(d)}")
 //         Err(e) => println(e.message())
 // ```
-pub fn decoder(dict: Bytes, probs: Bytes) -> Result<XzLzma2State, XzFault> []
-    todo("xz-nv.xzlzma2.decoder")
+pub fn decoder(var dict: Bytes, var probs: Bytes) -> Result<XzLzma2State, XzFault> []
+    // The array is checked against the DEFAULT model here, because the
+    // chunk that would name another one has not been read yet.  A
+    // model with larger parameters is refused where it is found, by
+    // `decode_chunk`, which is the call that knows it.
+    let want = xzlzma.probability_bytes(
+        xzlzma.probability_count(default_properties()))
+    if bytes.len(probs) < want
+        return Err(buffer_too_small(want, bytes.len(probs)))
+    if bytes.len(dict) < 1
+        // A dictionary of no bytes can hold no output, and the first
+        // match would have nothing to point at.
+        return Err(buffer_too_small(1, bytes.len(dict)))
+    Ok(XzLzma2State {
+        // Absent until a chunk carries one, which is also the flag
+        // that refuses a compressed chunk offering to continue a model
+        // that was never given.
+        props: None,
+        // The format requires the first chunk of a block to reset the
+        // dictionary, and nothing has happened yet, so it has not.
+        dict_reset: false,
+        state: 0,
+        reps: xzlzma.reps_start(),
+        produced: 0,
+        consumed: 0,
+        dict: dict,
+        probs: probs })
 
 // Decode one chunk into the decoder's dictionary.
 //
@@ -256,10 +468,198 @@ pub fn decoder(dict: Bytes, probs: Bytes) -> Result<XzLzma2State, XzFault> []
 //                 Err(e) => println(e.message())
 //         Err(e) => println(e.message())
 // ```
-pub fn decode_chunk(d: XzLzma2State, src: Bytes, off: Int) -> Result<XzLzma2State, XzFault> []
-    todo("xz-nv.xzlzma2.decode_chunk")
+pub fn decode_chunk(var d: XzLzma2State, src: Bytes, off: Int) -> Result<XzLzma2State, XzFault> []
+    match read_chunk(src, off)
+        Err(f) => Err(f)
+        Ok(c)  =>
+            if c.is_end
+                // The end marker ends a STREAM; it is not a chunk that
+                // produces anything.  A caller looping over chunks has
+                // to stop on it, not hand it here.
+                return Err(bad_chunk(XZ_LZMA2_END, off))
+            // THE FIRST-CHUNK RULE, checked before a byte of payload is
+            // decoded rather than discovered at the first match: a
+            // chunk that neither resets the dictionary nor follows one
+            // that did would let this block read the block before it.
+            if not d.dict_reset and not resets_dictionary(c.reset)
+                return Err(no_dictionary_reset(off))
+            if c.is_uncompressed
+                return copy_chunk(var d, c, src, off)
+            decode_lzma_chunk(var d, c, src, off)
+
+// An uncompressed chunk, copied through exactly as it stands.
+//
+// The only chunk kind that CANNOT make the data larger, which is what
+// an encoder reaches for when LZMA has nothing to work with: 200 KiB of
+// random bytes is four of these and thirteen bytes of overhead.
+fn copy_chunk(var d: XzLzma2State, c: XzLzma2Chunk, src: Bytes,
+              off: Int) -> Result<XzLzma2State, XzFault> []
+    let start = off + c.header_bytes
+    let n = c.compressed_size
+    let have = bytes.len(src) - start
+    if have < n
+        return Err(truncated(n - have, start))
+    // A dictionary reset restarts the dictionary, and the bytes before
+    // it are not merely unreachable but gone: `dict_reset` is what
+    // `dict.pos = 0` says in the C.  The format puts one at the first
+    // chunk of a block, where nothing has been produced yet, so this
+    // is the same zero either way for every stream an encoder writes.
+    var base = d.produced
+    if resets_dictionary(c.reset)
+        base = 0
+    if base + n > bytes.len(d.dict)
+        return Err(buffer_too_small(base + n, bytes.len(d.dict)))
+    var k = 0
+    while k < n
+        bytes.set_u8(d.dict, base + k, byte_of(src, start + k))
+        k = k + 1
+    var props = d.props
+    if resets_dictionary(c.reset)
+        // A dictionary reset implies the next LZMA chunk has to bring
+        // new properties, so there is nothing in force after this one.
+        props = None
+    Ok(XzLzma2State {
+        props: props,
+        dict_reset: d.dict_reset or resets_dictionary(c.reset),
+        state: d.state,
+        reps: d.reps,
+        produced: base + n,
+        // Where the chunk ended, so that a caller looping over chunks
+        // can feed the next one at the offset this answers.
+        consumed: start + n,
+        dict: d.dict,
+        probs: d.probs })
+
+// A compressed chunk: `uncompressed_size` bytes out of
+// `compressed_size` bytes of range-coded payload.
+//
+// The payload is decoded one symbol at a time until the chunk's own
+// uncompressed size is reached, and then the coder must have used
+// EXACTLY the payload: an LZMA2 chunk carries its sizes so that a
+// decoder needs no end marker, and a chunk with bytes left over or
+// bytes missed is a stream whose symbols and whose sizes disagree.
+fn decode_lzma_chunk(var d: XzLzma2State, c: XzLzma2Chunk, src: Bytes,
+                     off: Int) -> Result<XzLzma2State, XzFault> []
+    var model = default_properties()
+    if carries_properties(c.reset)
+        match c.props_byte
+            None    =>
+                // cov: skip — the reader sets the properties byte whenever the reset code carries one
+                return Err(bad_chunk(byte_of(src, off), off))
+            Some(b) =>
+                match xzlzma.properties(b)
+                    Err(f) =>
+                        return Err(f)
+                    Ok(p)  =>
+                        model = p
+    else
+        match d.props
+            // A chunk that continues a model needs one to continue.
+            // Letting it through would have `decode_symbol_props`
+            // build a literal coder out of parameters nobody wrote.
+            None    =>
+                return Err(bad_chunk(byte_of(src, off), off))
+            Some(p) =>
+                model = p
+    // The array was checked against the default model at creation;
+    // this is where the model the chunk actually named is checked.
+    let count = xzlzma.probability_count(model)
+    let want = xzlzma.probability_bytes(count)
+    if bytes.len(d.probs) < want
+        return Err(buffer_too_small(want, bytes.len(d.probs)))
+    var probs = d.probs
+    var st = d.state
+    var reps = d.reps
+    var out = d.produced
+    if resets_dictionary(c.reset)
+        out = 0
+    if c.reset != XZ_LZMA2_RESET_NONE
+        // Three of the four codes reset the state, and a state reset is
+        // the state machine, the four distances and every probability
+        // at once: the model is only defined relative to the position
+        // the reset put it in.  `reset_probabilities` writes through
+        // the caller's array, so nothing here is rebound.
+        match xzlzma.reset_probabilities(var probs, count)
+            Err(f) =>
+                // cov: skip — the count is the model's own
+                return Err(f)
+            Ok(_)  =>
+                st = 0
+                reps = xzlzma.reps_start()
+    let payload = off + c.header_bytes
+    let have = bytes.len(src) - payload
+    if have < c.compressed_size
+        return Err(truncated(c.compressed_size - have, payload))
+    let target = out + c.uncompressed_size
+    // THE CODER IS GIVEN THE CHUNK'S PAYLOAD AND NOTHING ELSE.  A
+    // coder handed the whole file would read on into the next chunk's
+    // header when a chunk's symbols ran out, decode whatever those
+    // bytes say, and very likely reach the declared size doing it —
+    // which is the failure a decoder must not be able to have.  The
+    // slice is bounded; the sizes are checked against the same bound.
+    let payload_src = bytes.slice(src, payload, payload + c.compressed_size)
+    var coder = xzrange.start(payload_src, 0)
+    if not coder.ok
+        return Err(bad_range(payload))
+    var produced = out
+    while produced < target
+        let s = xzlzma.decode_symbol_props(model, coder, st, reps, var probs,
+                                           payload_src, 0, var d.dict, produced)
+        coder = s.coder
+        st = s.state
+        reps = s.reps
+        produced = s.produced
+        if s.ended
+            // An LZMA2 chunk never carries an end marker: the format
+            // gives every chunk its size instead, which is one of the
+            // three reasons it exists.  One that does was not written
+            // by an encoder.
+            return Err(bad_chunk(XZ_LZMA2_END, payload))
+        if s.fault == xzlzma.XZ_SYMBOL_FAULT_RANGE
+            return Err(bad_range(payload))
+        if s.fault == xzlzma.XZ_SYMBOL_FAULT_DISTANCE
+            return Err(distance_too_far(s.reps.r0, s.produced))
+        if s.fault == xzlzma.XZ_SYMBOL_FAULT_BUFFER
+            return Err(buffer_too_small(s.produced + 1, bytes.len(d.dict)))
+    if produced != target
+        // A symbol wrote past the size the chunk declared, and no
+        // conforming encoder emits one: it would have had to end the
+        // chunk at the symbol before.
+        return Err(size_mismatch(c.uncompressed_size, produced - out, payload))
+    // THE LAST BYTE, AND THE CHECK THAT MAKES LZMA2 DIFFERENT FROM
+    // `.lzma`.  The chunk's size says where its symbols stop, but the
+    // coder may still hold an interval narrow enough to want one more
+    // source byte, and the reference decoder reads it before asking
+    // whether the coder came to rest.  A coder that stops with a
+    // non-zero code has bytes after the last symbol that were never
+    // written by an encoder — and since an LZMA2 chunk may not carry an
+    // end marker, there is no symbol in the format that could account
+    // for them either.
+    let settled = xzrange.normalize(coder, payload_src, 0)
+    if not xzrange.is_clean(settled)
+        return Err(bad_range(payload + settled.consumed))
+    coder = settled
+    if coder.consumed != c.compressed_size
+        // The chunk had bytes the symbols did not use, or the symbols
+        // needed more than it had.
+        return Err(size_mismatch(c.compressed_size, coder.consumed, payload))
+    Ok(XzLzma2State {
+        props: Some(model),
+        dict_reset: d.dict_reset or resets_dictionary(c.reset),
+        state: st,
+        reps: reps,
+        produced: produced,
+        consumed: payload + c.compressed_size,
+        dict: d.dict,
+        probs: probs })
 
 // How many bytes the decoder has produced.
+//
+// Counted from the dictionary reset, which is the start of the block
+// the decoder is working on.  A dictionary reset that arrives after
+// output has been produced restarts the count, because it restarts the
+// dictionary — the format puts one at the first chunk of a block, so
+// for every stream an encoder writes the count is the same either way.
 //
 // ```novo
 // use std.bytes
@@ -271,9 +671,13 @@ pub fn decode_chunk(d: XzLzma2State, src: Bytes, off: Int) -> Result<XzLzma2Stat
 //         Err(e) => println(e.message())
 // ```
 pub fn produced_of(d: XzLzma2State) -> Int []
-    todo("xz-nv.xzlzma2.produced_of")
+    d.produced
 
 // How many source bytes the decoder has consumed.
+//
+// The offset just past the last chunk it read, in the same coordinates
+// `decode_chunk` was given — so a caller looping over chunks feeds the
+// next one at the offset this answers.
 //
 // ```novo
 // use std.bytes
@@ -285,7 +689,7 @@ pub fn produced_of(d: XzLzma2State) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn consumed_of(d: XzLzma2State) -> Int []
-    todo("xz-nv.xzlzma2.consumed_of")
+    d.consumed
 
 // The properties in force, or `None` before any chunk carried some.
 //
@@ -302,7 +706,7 @@ pub fn consumed_of(d: XzLzma2State) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn properties_of(d: XzLzma2State) -> ?XzLzmaProps []
-    todo("xz-nv.xzlzma2.properties_of")
+    d.props
 
 // The bytes a chunk header encodes to, for the encoder release.
 //
@@ -319,4 +723,60 @@ pub fn properties_of(d: XzLzma2State) -> ?XzLzmaProps []
 //         Err(e) => println(e.message())
 // ```
 pub fn chunk_header_bytes(c: XzLzma2Chunk) -> Result<Bytes, XzFault> []
-    todo("xz-nv.xzlzma2.chunk_header_bytes")
+    if c.header_bytes < 1 or c.header_bytes > 6
+        // The widest header the format has is six bytes.  A length
+        // outside that is a value a decoder cannot produce, so writing
+        // one would be writing a header nothing can read back.
+        return Err(bad_parameter("a chunk header is one to six bytes"))
+    var b = bytes.zeros(c.header_bytes)
+    if c.is_end
+        bytes.set_u8(b, 0, XZ_LZMA2_END)
+        if c.header_bytes != 1
+            return Err(bad_parameter("an end marker's header is one byte"))
+        return Ok(b)
+    if c.is_uncompressed
+        // Control and one size: the two uncompressed controls differ
+        // only in whether the dictionary is reset, and the size is the
+        // bytes the chunk occupies, which is what it produces.
+        if c.header_bytes != 3
+            return Err(bad_parameter("an uncompressed chunk's header is three bytes"))
+        if c.uncompressed_size < 1 or c.uncompressed_size > XZ_LZMA2_UNCOMPRESSED_MOST
+            // One to 65,536, which is what two bytes minus one can say.
+            return Err(bad_parameter("an uncompressed chunk is one to 65536 bytes"))
+        if resets_dictionary(c.reset)
+            bytes.set_u8(b, 0, XZ_LZMA2_UNCOMPRESSED_RESET)
+        else
+            bytes.set_u8(b, 0, XZ_LZMA2_UNCOMPRESSED_CONTINUE)
+        let n = c.uncompressed_size - 1
+        bytes.set_u8(b, 1, (n >> 8) & 0xFF)
+        bytes.set_u8(b, 2, n & 0xFF)
+        return Ok(b)
+    // A compressed chunk: the control byte carries the reset code in
+    // bits 5 and 6 and the top of the uncompressed size in bits 0 to
+    // 4, and the sizes that follow are both minus one.
+    let want_props = carries_properties(c.reset)
+    var h = 5
+    if want_props
+        h = 6
+    if c.header_bytes != h
+        return Err(bad_parameter("a compressed chunk's header length must match its reset code"))
+    if c.uncompressed_size < 1 or c.uncompressed_size > XZ_LZMA2_CHUNK_OUT_MOST
+        // Five bits of control plus two bytes minus one: two megabytes.
+        return Err(bad_parameter("a compressed chunk produces one to 2097152 bytes"))
+    if c.compressed_size < 1 or c.compressed_size > XZ_LZMA2_UNCOMPRESSED_MOST
+        // Two bytes minus one, and no more than the encoder's own
+        // chunk buffer: 65,536.
+        return Err(bad_parameter("a compressed chunk occupies one to 65536 bytes"))
+    let u = c.uncompressed_size - 1
+    let cs = c.compressed_size - 1
+    bytes.set_u8(b, 0, XZ_LZMA2_COMPRESSED_LEAST | (c.reset << 5) | (u >> 16))
+    bytes.set_u8(b, 1, (u >> 8) & 0xFF)
+    bytes.set_u8(b, 2, u & 0xFF)
+    bytes.set_u8(b, 3, (cs >> 8) & 0xFF)
+    bytes.set_u8(b, 4, cs & 0xFF)
+    if want_props
+        match c.props_byte
+            None    =>
+                return Err(bad_parameter("a chunk with new properties needs its properties byte"))
+            Some(p) => bytes.set_u8(b, 5, p)
+    Ok(b)

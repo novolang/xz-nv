@@ -1,0 +1,1165 @@
+use std.bytes
+use std.test
+use xzerror
+use xzstream
+use xzcheck
+use xzvli
+use xzfilter
+use xzlzma
+use xzlzma2
+use xzdec
+
+// The refusal suite: every fault kind the package can name, every
+// argument the format puts a bound on, and every malformed shape a
+// decoder has to tell from a good file.
+//
+// It exists because the suites that came before it prove what the
+// package DOES and this one proves what it will not do.  A decoder is
+// the half of a codec whose mistakes are silent, so the shapes below
+// are the ones a damaged file actually takes: a truncated tail, a
+// count that is one too large, a control byte in the gap the format
+// leaves undefined.
+
+// One row of the fault vocabulary: the kind, the name it answers, and
+// the four questions' answers.
+fn fault_row(k: XzFaultKind, name: Str, corrupt: Bool, incomplete: Bool, lim: Bool,
+             unsupported: Bool) -> Str []
+    let got = xzerror.kind_name(k)
+    if got != name
+        return "kind_name: " + got + ", want " + name
+    let f = xzerror.fault(k, xzerror.here(3, 4096, xzerror.XZ_LAYER_LZMA2))
+    let said = xzerror.describe(f)
+    if said == ""
+        return name + ": describe answered nothing"
+    if xzerror.is_corrupt(k) != corrupt
+        return name + ": is_corrupt differs"
+    if xzerror.is_incomplete(k) != incomplete
+        return name + ": is_incomplete differs"
+    if xzerror.is_limit(k) != lim
+        return name + ": is_limit differs"
+    if xzerror.is_unsupported(k) != unsupported
+        return name + ": is_unsupported differs"
+    ""
+
+@test
+fn test_every_fault_kind_names_itself_and_answers_the_four_questions() [io]
+    var report = ""
+    let rows = [
+        fault_row(XzBadMagic, "bad-magic", true, false, false, false),
+        fault_row(XzBadFooterMagic, "bad-footer-magic", true, false, false, false),
+        fault_row(XzHeaderCrcMismatch(1, 2), "header-crc-mismatch", true, false, false, false),
+        fault_row(XzFlagsMismatch, "flags-mismatch", true, false, false, false),
+        fault_row(XzReservedBitSet(3), "reserved-bit-set", true, false, false, false),
+        fault_row(XzUnsupportedCheck(2), "unsupported-check", false, false, false, true),
+        fault_row(XzBadVli(4), "bad-vli", true, false, false, false),
+        fault_row(XzBadBlockHeader(8), "bad-block-header", true, false, false, false),
+        fault_row(XzUnsupportedFilter(0x20), "unsupported-filter", false, false, false, true),
+        fault_row(XzBadFilterChain("two compression filters"), "bad-filter-chain", true, false,
+                  false, false),
+        fault_row(XzBadFilterProperties(0x03), "bad-filter-properties", true, false, false, false),
+        fault_row(XzBadLzma2Chunk(0x03), "bad-lzma2-chunk", true, false, false, false),
+        fault_row(XzLzma2NoDictionaryReset, "lzma2-no-dictionary-reset", true, false, false, false),
+        fault_row(XzBadLzmaProperties(0xE1), "bad-lzma-properties", true, false, false, false),
+        fault_row(XzDistanceTooFar(70000, 12), "distance-too-far", true, false, false, false),
+        fault_row(XzBadRangeCoder(9), "bad-range-coder", true, false, false, false),
+        fault_row(XzSizeMismatch(100, 99), "size-mismatch", true, false, false, false),
+        fault_row(XzCheckMismatch(4), "check-mismatch", true, false, false, false),
+        fault_row(XzIndexMismatch("the count"), "index-mismatch", true, false, false, false),
+        fault_row(XzBadBackwardSize(7), "bad-backward-size", true, false, false, false),
+        fault_row(XzTrailingBytes(11), "trailing-bytes", true, false, false, false),
+        fault_row(XzTruncated(12), "truncated", false, true, false, false),
+        fault_row(XzLimitReached(64, 32), "limit-reached", false, false, true, false),
+        fault_row(XzBufferTooSmall(64, 32), "buffer-too-small", false, false, true, false),
+        fault_row(XzBadParameter("a preset is 0 to 9"), "bad-parameter", false, false, false, false),
+        fault_row(XzSourceFailed, "source-failed", false, false, false, false)]
+    for i in 0..list.len(rows)
+        if rows[i] != ""
+            report = report + rows[i] + "\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+@test
+fn test_the_stream_layer_refuses_the_shapes_the_format_forbids() [io]
+    // A check type is four bits of the flags byte: 16 is not one.
+    match xzstream.flags(16)
+        Ok(_)  => test.fail("16 does not fit in four bits")
+        Err(f) =>
+            test.assert(xzerror.kind_name(f.kind) == "bad-parameter")
+            test.assert(not xzerror.is_corrupt(f.kind))
+    match xzstream.flags(-1)
+        Ok(_)  => test.fail("-1 does not fit in four bits")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-parameter")
+    // A header shorter than twelve bytes is not a damaged header, it is
+    // a caller who has not been given the whole thing yet.
+    match xzstream.read_header(bytes.zeros(11))
+        Ok(_)  => test.fail("eleven bytes are not a header")
+        Err(f) =>
+            test.assert(xzerror.is_incomplete(f.kind))
+            test.assert(not xzerror.is_corrupt(f.kind))
+    match xzstream.read_footer(bytes.zeros(11))
+        Ok(_)  => test.fail("eleven bytes are not a footer")
+        Err(f) =>
+            test.assert(xzerror.is_incomplete(f.kind))
+            test.assert(not xzerror.is_corrupt(f.kind))
+    // The index size a footer records is the index's length less the
+    // indicator and the CRC: four-aligned and positive.
+    match xzstream.flags(xzcheck.XZ_CHECK_CRC64)
+        Err(f) => test.fail("crc64 is a check type: " + f.message())
+        Ok(fl) =>
+            match xzstream.footer_bytes(fl, 6)
+                Ok(_)  => test.fail("six bytes is not a four-aligned index")
+                Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-parameter")
+            match xzstream.footer_bytes(fl, 0)
+                Ok(_)  => test.fail("an index is never empty")
+                Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-parameter")
+            match xzstream.footer_bytes(fl, 8)
+                Ok(_)  => test.assert(true)
+                Err(f) => test.fail("eight is a four-aligned index size: " + f.message())
+    // A stream's padding is zeroes to the next four-byte boundary.
+    test.assert(xzstream.padding_after(12) == 0)
+    test.assert(xzstream.padding_after(13) == 3)
+
+@test
+fn test_a_check_type_is_named_and_sized_even_when_it_is_reserved() [io]
+    // Every one of the sixteen types has a name and a size; a decoder
+    // that could not size a reserved one could not skip it.
+    let want_size = [0, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64]
+    let want_supported = [true, true, false, false, true, false, false, false,
+                          false, false, true, false, false, false, false, false]
+    var report = ""
+    for i in 0..16
+        match xzcheck.size_of(i)
+            Err(f) =>
+                report = report + "${i}: " + f.message() + "\n"
+            Ok(n)  =>
+                if n != want_size[i]
+                    report = report + "${i}: size " + "${n}" + "\n"
+        if xzcheck.is_supported(i) != want_supported[i]
+            report = report + "${i}: is_supported differs\n"
+        if xzcheck.name_of(i) == ""
+            report = report + "${i}: no name\n"
+    // Outside the sixteen is a caller's mistake, not a file's.
+    match xzcheck.size_of(16)
+        Ok(_)  =>
+            report = report + "16 is not a check type\n"
+        Err(f) =>
+            if not xzerror.is_limit(f.kind) and xzerror.kind_name(f.kind) != "bad-parameter"
+                report = report + "size_of(16): " + xzerror.kind_name(f.kind) + "\n"
+    // The four the format defines have the names the format gives them.
+    let names = [xzcheck.name_of(xzcheck.XZ_CHECK_NONE), xzcheck.name_of(xzcheck.XZ_CHECK_CRC32),
+                 xzcheck.name_of(xzcheck.XZ_CHECK_CRC64), xzcheck.name_of(xzcheck.XZ_CHECK_SHA256)]
+    if names[0] != "none" or names[1] != "crc32" or names[2] != "crc64" or names[3] != "sha256"
+        report = report + "the four names differ\n"
+    if xzcheck.name_of(9) != "reserved-9"
+        report = report + "a reserved type is named reserved-N\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+@test
+fn test_a_variable_length_integer_refuses_the_shapes_the_format_forbids() [io]
+    var report = ""
+    // A number with two spellings is a number two decoders can disagree
+    // about, so only the shortest form is legal: 0x80 0x00 is one.
+    let noncanonical = bytes.from_hex("8000") ?? bytes.zeros(1)
+    let v = xzvli.decode(noncanonical, 0)
+    if v.ok
+        report = report + "a padded zero decoded\n"
+    let f = xzvli.decode_fault(v, 0) ?? xzerror.fault(XzBadParameter("none"), xzerror.here(0, 0, 0))
+    if xzerror.kind_name(f.kind) != "bad-vli"
+        report = report + "non-canonical: " + xzerror.kind_name(f.kind) + "\n"
+    // A ninth byte that carries more than the format's one bit.
+    let nineth = bytes.from_hex("FFFFFFFFFFFFFFFFFFFF7F") ?? bytes.zeros(1)
+    if xzvli.decode(nineth, 0).ok
+        report = report + "a ten-byte integer decoded\n"
+    // A buffer that ends in the middle of one answers the SAME flag as a
+    // padded one, and `bytes` is zero for both — which is the design
+    // `decode`'s comment states: the caller tells them apart by asking
+    // whether the source had the nine bytes a VLI may take, not by the
+    // answer here.  Pinned so that a later change to that has to say so.
+    let cut = bytes.from_hex("80") ?? bytes.zeros(1)
+    let v2 = xzvli.decode(cut, 0)
+    if v2.ok
+        report = report + "a cut integer decoded\n"
+    if v2.bytes != 0
+        report = report + "a cut integer answered " + "${v2.bytes}" + " bytes\n"
+    let f2 = xzvli.decode_fault(v2, 0) ?? xzerror.fault(XzBadParameter("none"),
+                                                        xzerror.here(0, 0, 0))
+    if xzerror.kind_name(f2.kind) != "bad-vli"
+        report = report + "a cut integer: " + xzerror.kind_name(f2.kind) + "\n"
+    // Nine bytes is the ceiling and what the caller checks against.
+    if xzvli.XZ_VLI_BYTES_MOST != 9
+        report = report + "XZ_VLI_BYTES_MOST is 9\n"
+    // The encoder's half has the same bounds.
+    match xzvli.encoded_bytes(-1)
+        Ok(_)  =>
+            report = report + "encoded_bytes(-1)\n"
+        Err(f) =>
+            report = report + check_name(f, "bad-parameter", "encoded_bytes(-1)")
+    match xzvli.encode(-1)
+        Ok(_)  =>
+            report = report + "encode(-1)\n"
+        Err(f) =>
+            report = report + check_name(f, "bad-parameter", "encode(-1)")
+    match xzvli.encode(0)
+        Err(f) =>
+            report = report + "encode(0): " + f.message() + "\n"
+        Ok(b)  =>
+            if bytes.to_hex(b) != "00"
+                report = report + "zero is one byte\n"
+            // A destination too short is a buffer fault and NOT damage:
+            // the caller can raise the number.
+            var small = bytes.zeros(0)
+            match xzvli.encode_into(0, small, 0)
+                Ok(_)  =>
+                    report = report + "a zero-byte buffer took a byte\n"
+                Err(f) =>
+                    if not xzerror.is_limit(f.kind)
+                        report = report + "encode_into: " + xzerror.kind_name(f.kind) + "\n"
+    if xzvli.round_up(5) != 8
+        report = report + "round_up(5) is 8\n"
+    if xzvli.padding_after(13) != 3
+        report = report + "padding_after(13) is 3\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+// One line of a report when a fault is not the kind it should be.
+fn check_name(f: XzFault, name: Str, what: Str) -> Str []
+    if xzerror.kind_name(f.kind) == name
+        ""
+    else
+        what + ": " + xzerror.kind_name(f.kind) + "\n"
+
+// ---------------------------------------------------------------------
+// Part two: the entry points the publish shard asks by name, the filter
+// layer's refusals, and the pump fed a byte at a time.
+// ---------------------------------------------------------------------
+
+// The content the pump test compresses: long-range structure, so a
+// block is bigger than a chunk and the decoder has work to do between
+// calls.
+fn textish(n: Int) -> Bytes
+    let words = bytes.from_str("the xz format is a container for lzma2 and lzma1 and crc64 ")
+    var b = bytes.zeros(n)
+    var i = 0
+    while i < n
+        bytes.set_u8(b, i, bytes.byte_at(words, i % bytes.len(words)) ?? 0)
+        i = i + 1
+    b
+
+@test
+fn test_the_two_entry_points_the_publish_shard_names_are_reachable() [io]
+    // `xzlzma.decode_symbol_props` is the implementation `decode_symbol`
+    // calls, and `xzrange.normalize` is the call that ends an LZMA2
+    // chunk.  Both are new surface in this release and the shard that
+    // refuses a `pub fn` no test names asks for exactly this.
+    match xzlzma.properties(0x5D)
+        Err(f) => test.fail("properties: " + f.message())
+        Ok(p)  =>
+            let count = xzlzma.probability_count(p)
+            var probs = bytes.zeros(xzlzma.probability_bytes(count))
+            match xzlzma.reset_probabilities(probs, count)
+                Err(f) => test.fail("reset: " + f.message())
+                Ok(_)  => ()
+            var dst = bytes.zeros(64)
+            let s = xzlzma.decode_symbol_props(p, xzrange.start(bytes.zeros(16), 0), 0,
+                                               xzlzma.reps_start(), probs,
+                                               bytes.zeros(16), 0, dst, 0)
+            // A symbol decoded against a reset model over a zero source
+            // is a literal, and a literal is one output byte.
+            test.assert(s.fault == xzlzma.XZ_SYMBOL_FAULT_NONE)
+            test.assert(s.produced == 1)
+            test.assert(not s.ended)
+            test.assert(s.state >= 0 and s.state < xzlzma.XZ_STATES)
+    // A coder whose interval is already wide normalises nothing and
+    // consumes nothing beyond its five initial bytes.
+    let r = xzrange.normalize(xzrange.start(bytes.zeros(16), 0), bytes.zeros(16), 0)
+    test.assert(r.ok)
+    test.assert(r.consumed == 5)
+
+@test
+fn test_the_filter_layer_names_aligns_and_refuses_every_id() [io]
+    var report = ""
+    // The eight converters and their published alignments, plus the two
+    // filters that are not converters at all.
+    let ids = [xzfilter.XZ_FILTER_X86, xzfilter.XZ_FILTER_POWERPC, xzfilter.XZ_FILTER_IA64,
+               xzfilter.XZ_FILTER_ARM, xzfilter.XZ_FILTER_ARMTHUMB, xzfilter.XZ_FILTER_SPARC,
+               xzfilter.XZ_FILTER_ARM64, xzfilter.XZ_FILTER_RISCV]
+    let names = ["x86", "powerpc", "ia64", "arm", "armthumb", "sparc", "arm64", "riscv"]
+    let aligns = [1, 4, 16, 4, 2, 4, 4, 2]
+    for i in 0..8
+        if not xzfilter.is_branch(ids[i])
+            report = report + names[i] + " is not a branch converter\n"
+        if xzfilter.is_compression(ids[i])
+            report = report + names[i] + " is not a compression filter\n"
+        if xzfilter.name_of(ids[i]) != names[i]
+            report = report + names[i] + ": name is " + xzfilter.name_of(ids[i]) + "\n"
+        match xzfilter.branch_alignment(ids[i])
+            Err(f) =>
+                report = report + names[i] + ": " + f.message() + "\n"
+            Ok(n)  =>
+                if n != aligns[i]
+                    report = report + names[i] + ": alignment ${n} not ${aligns[i]}\n"
+        // A start offset that is not a multiple of the alignment is a
+        // caller's mistake, and the filter says so rather than writing
+        // a converter that would corrupt the stream.  x86 works at one
+        // byte, so every start is aligned for it and the check is that
+        // an odd start is accepted rather than refused.
+        match xzfilter.branch(ids[i], aligns[i] + 1)
+            Ok(_)  =>
+                if aligns[i] != 1
+                    report = report + names[i] + ": an unaligned start was accepted\n"
+            Err(f) =>
+                if aligns[i] == 1
+                    report = report + names[i] + ": an aligned start was refused\n"
+                else if xzerror.kind_name(f.kind) != "bad-filter-properties"
+                    report = report + names[i] + ": unaligned start is " +
+                        xzerror.kind_name(f.kind) + "\n"
+        match xzfilter.branch(ids[i], 0)
+            Ok(f)  =>
+                match xzfilter.branch_start(f)
+                    Ok(n)   =>
+                        if n != 0
+                            report = report + names[i] + ": start is ${n}\n"
+                    Err(f2) =>
+                        report = report + names[i] + ": branch_start: " + f2.message() + "\n"
+            Err(f) =>
+                report = report + names[i] + ": branch: " + f.message() + "\n"
+    // The two compression filters, and the two ids that are neither.
+    if xzfilter.name_of(xzfilter.XZ_FILTER_LZMA1) != "lzma1"
+        report = report + "lzma1's name differs\n"
+    if xzfilter.name_of(xzfilter.XZ_FILTER_LZMA2) != "lzma2"
+        report = report + "lzma2's name differs\n"
+    if xzfilter.name_of(xzfilter.XZ_FILTER_DELTA) != "delta"
+        report = report + "delta's name differs\n"
+    if xzfilter.name_of(0x7F) == ""
+        report = report + "an unknown id has no name at all\n"
+    if xzfilter.is_branch(xzfilter.XZ_FILTER_DELTA) or xzfilter.is_branch(0x7F)
+        report = report + "delta or an unknown id read as a converter\n"
+    if not xzfilter.is_compression(xzfilter.XZ_FILTER_LZMA1) or
+       not xzfilter.is_compression(xzfilter.XZ_FILTER_LZMA2)
+        report = report + "the two lzma filters are not compression filters\n"
+    // A non-converter has no alignment, and the answer is named.
+    match xzfilter.branch_alignment(xzfilter.XZ_FILTER_DELTA)
+        Ok(_)  =>
+            report = report + "delta has a branch alignment\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "unsupported-filter"
+                report = report + "delta alignment: " + xzerror.kind_name(f.kind) + "\n"
+    match xzfilter.branch(0x7F, 0)
+        Ok(_)  =>
+            report = report + "an unknown id built a converter\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "unsupported-filter"
+                report = report + "branch(0x7F): " + xzerror.kind_name(f.kind) + "\n"
+    // A delta filter's distance is its properties byte plus one, and a
+    // filter that is not a delta has none.
+    match xzfilter.delta(1)
+        Err(f) =>
+            report = report + "delta(1): " + f.message() + "\n"
+        Ok(d)  =>
+            match xzfilter.delta_distance(d)
+                Ok(n)  =>
+                    if n != 1
+                        report = report + "delta(1) reads back as ${n}\n"
+                Err(f) =>
+                    report = report + "delta_distance: " + f.message() + "\n"
+            match xzfilter.delta_distance(d)
+                Err(f) =>
+                    report = report + "unreachable\n"
+                Ok(_)  => ()
+            match xzfilter.branch_start(d)
+                Ok(_)  =>
+                    report = report + "a delta filter has a branch start\n"
+                Err(f) =>
+                    if xzerror.kind_name(f.kind) != "unsupported-filter"
+                        report = report + "branch_start(delta): " + xzerror.kind_name(f.kind) + "\n"
+    match xzfilter.delta(0)
+        Ok(_)  =>
+            report = report + "delta zero is not a distance\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-filter-properties"
+                report = report + "delta(0): " + xzerror.kind_name(f.kind) + "\n"
+    match xzfilter.delta(257)
+        Ok(_)  =>
+            report = report + "delta 257 is past the byte\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-filter-properties"
+                report = report + "delta(257): " + xzerror.kind_name(f.kind) + "\n"
+    // The dictionary size a byte names, both ends of it.
+    match xzfilter.lzma2_dictionary_bytes(40)
+        Ok(n)  =>
+            if n != 4294967295
+                report = report + "dictionary byte 40 is ${n}\n"
+        Err(f) =>
+            report = report + "dictionary_bytes(40): " + f.message() + "\n"
+    match xzfilter.lzma2_dictionary_bytes(41)
+        Ok(_)  =>
+            report = report + "dictionary byte 41 is not a byte\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-filter-properties"
+                report = report + "dictionary_bytes(41): " + xzerror.kind_name(f.kind) + "\n"
+    match xzfilter.lzma2_dictionary_byte_for(-1)
+        Ok(_)  =>
+            report = report + "a negative dictionary has a byte\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-parameter"
+                report = report + "dictionary_byte_for(-1): " + xzerror.kind_name(f.kind) + "\n"
+    match xzfilter.lzma2_dictionary_byte_for(4294967296)
+        Ok(_)  =>
+            report = report + "past four gibibytes has a byte\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-filter-properties"
+                report = report + "dictionary_byte_for(4GiB): " +
+                    xzerror.kind_name(f.kind) + "\n"
+    match xzfilter.lzma2(41)
+        Ok(_)  =>
+            report = report + "lzma2 byte 41 is not a byte\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-filter-properties"
+                report = report + "lzma2(41): " + xzerror.kind_name(f.kind) + "\n"
+    // The chain rules: no more than four, one compression filter at the
+    // end, and no converter twice.
+    let d1 = xzfilter.delta(1)
+    let x86 = xzfilter.branch(xzfilter.XZ_FILTER_X86, 0)
+    let ppc = xzfilter.branch(xzfilter.XZ_FILTER_POWERPC, 0)
+    let l2 = xzfilter.lzma2(23)
+    match d1
+        Err(f) =>
+            report = report + "delta: " + f.message() + "\n"
+        Ok(dv) =>
+            match x86
+                Err(f) =>
+                    report = report + "x86: " + f.message() + "\n"
+                Ok(xv) =>
+                    match xzfilter.check_chain([dv, xv, dv, xv, dv])
+                        Ok(_)  =>
+                            report = report + "five filters are not a chain\n"
+                        Err(f) =>
+                            if xzerror.kind_name(f.kind) != "bad-filter-chain"
+                                report = report + "five filters: " + xzerror.kind_name(f.kind) + "\n"
+                    match xzfilter.check_chain([xv, dv, xv])
+                        Ok(_)  =>
+                            report = report + "a converter twice is not a chain\n"
+                        Err(f) =>
+                            if xzerror.kind_name(f.kind) != "bad-filter-chain"
+                                report = report + "twice: " + xzerror.kind_name(f.kind) + "\n"
+                    match xzfilter.check_chain([dv])
+                        Ok(_)  =>
+                            report = report + "a chain with no compression filter\n"
+                        Err(f) =>
+                            if xzerror.kind_name(f.kind) != "bad-filter-chain"
+                                report = report + "one converter: " + xzerror.kind_name(f.kind) + "\n"
+    match ppc
+        Err(f) =>
+            report = report + "powerpc: " + f.message() + "\n"
+        Ok(pv) =>
+            match l2
+                Err(f) =>
+                    report = report + "lzma2: " + f.message() + "\n"
+                Ok(lv) =>
+                    match xzfilter.check_chain([pv, lv])
+                        Ok(n)  =>
+                            if n != 2
+                                report = report + "a two-filter chain is ${n}\n"
+                        Err(f) =>
+                            report = report + "two filters: " + f.message() + "\n"
+    // A converter asked to write past the end of its destination says
+    // so, and does not write anyway.
+    match x86
+        Err(f) =>
+            report = report + "x86: " + f.message() + "\n"
+        Ok(xv) =>
+            var tiny = bytes.zeros(2)
+            match xzfilter.encode_in_place(xv, tiny, 0, 8)
+                Ok(_)  =>
+                    report = report + "a two-byte destination took eight bytes\n"
+                Err(f) =>
+                    if not xzerror.is_limit(f.kind)
+                        report = report + "encode_in_place: " + xzerror.kind_name(f.kind) + "\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+// A corpus whose matches land at whichever distance the model last
+// remembered: sixteen distinct twelve-byte tokens walked by a linear
+// congruential sequence, so a token returns at an irregular gap and the
+// encoder meets rep0, rep1 and rep2 as it goes, with matches long
+// enough to reach the alignment tree.
+fn walk(n: Int) -> Bytes
+    var corpus = bytes.zeros(0)
+    var t = 0
+    while t < 16
+        var b = bytes.zeros(12)
+        var k = 0
+        while k < 12
+            bytes.set_u8(b, k, (t * 37 + k * 11) & 0xFF)
+            k = k + 1
+        corpus = corpus + b
+        t = t + 1
+    var out = bytes.zeros(0)
+    var x = 7
+    var i = 0
+    while i < n
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        let which = (x >>> 16) & 15
+        out = out + bytes.slice(corpus, which * 12, which * 12 + 12)
+        i = i + 1
+    out
+
+fn with_block(block: Int) -> Result<XzSettings, XzFault> []
+    let s = match xzenc.settings(6)
+        Err(f) =>
+            return Err(f)
+        Ok(x)  => x
+    xzenc.with_block_bytes(s, block)
+
+@test
+fn test_the_encoder_codes_the_align_tree_and_every_remembered_distance() [io]
+    // `walk` was built for this test: a token that returns at a gap the
+    // model has a slot for is a rep match, and a new match of twelve
+    // bytes is long enough that its length leaves the three-bit tree and
+    // goes through the direct bits and the alignment tree.  Both were
+    // unexercised by the pinned vectors, which are five bytes long.
+    let want = walk(2000)
+    match with_block(4096)
+        Err(f) => test.fail("settings: " + f.message())
+        Ok(s)  =>
+            match xzenc.compress_with(want, s)
+                Err(f)     => test.fail("compress: " + f.message())
+                Ok(packed) =>
+                    test.assert(bytes.len(packed) < bytes.len(want))
+                    match xzdec.decompress(packed)
+                        Err(f)  => test.fail("decompress: " + f.message())
+                        Ok(got) =>
+                            test.assert(bytes.to_hex(got) == bytes.to_hex(want))
+                            test.assert(xzdec.blocks_done(xzdec.decoder()) == 0)
+
+@test
+fn test_the_pump_takes_a_stream_a_byte_at_a_time_and_between_streams() [io]
+    var report = ""
+    let want = textish(20000)
+    match with_block(4096)
+        Err(f) =>
+            return test.fail("settings: " + f.message())
+        Ok(s)  =>
+            match xzenc.compress_with(want, s)
+                Err(f)     =>
+                    return test.fail("compress: " + f.message())
+                Ok(packed) =>
+                    // One byte per call: every "I need more" arm of the
+                    // pump runs, and the pending buffer is drained and
+                    // refilled thousands of times.
+                    var d = xzdec.decoder()
+                    var out = bytes.zeros(0)
+                    var i = 0
+                    while i < bytes.len(packed)
+                        let (next, part) = xzdec.feed(d, bytes.slice(packed, i, i + 1))
+                        d = next
+                        out = out + part
+                        i = i + 1
+                    match xzdec.finish(d)
+                        Err(f)   =>
+                            report = report + "finish: " + f.message() + "\n"
+                        Ok(tail) =>
+                            if bytes.to_hex(out + tail) != bytes.to_hex(want)
+                                report = report + "one byte at a time differs\n"
+                    if xzdec.total_in(d) != bytes.len(packed)
+                        report = report + "total_in is ${xzdec.total_in(d)}\n"
+                    if xzdec.total_out(d) != bytes.len(want)
+                        report = report + "total_out is ${xzdec.total_out(d)}\n"
+                    if xzdec.blocks_done(d) < 2
+                        report = report + "a 20 KiB stream at 4 KiB a block is more than one\n"
+                    if xzdec.streams_done(d) != 1
+                        report = report + "streams_done is ${xzdec.streams_done(d)}\n"
+                    if xzdec.check_type(d) != xzcheck.XZ_CHECK_CRC64
+                        report = report + "check_type is ${xzdec.check_type(d)}\n"
+                    if xzdec.error(d) != None
+                        report = report + "a good stream left an error\n"
+                    // Two streams back to back with four bytes of padding
+                    // between them, which is what `xz` writes when it
+                    // concatenates.
+                    var d2 = xzdec.decoder()
+                    var parts = bytes.zeros(0)
+                    let both = packed + bytes.zeros(4) + packed
+                    var k = 0
+                    while k < bytes.len(both)
+                        let (next, part) = xzdec.feed(d2, bytes.slice(both, k, k + 1))
+                        d2 = next
+                        parts = parts + part
+                        k = k + 1
+                    match xzdec.finish(d2)
+                        Err(f)   =>
+                            report = report + "finish two: " + f.message() + "\n"
+                        Ok(tail) =>
+                            if bytes.to_hex(parts + tail) != bytes.to_hex(want + want)
+                                report = report + "two streams differ\n"
+                    if xzdec.streams_done(d2) != 2
+                        report = report + "streams_done is ${xzdec.streams_done(d2)}\n"
+                    // The output limit is the caller's, and the bytes past
+                    // it are refused rather than produced.
+                    match xzdec.decompress_bounded(packed, 67108864, 100)
+                        Ok(_)  =>
+                            report = report + "a hundred-byte limit produced 20 KiB\n"
+                        Err(f) =>
+                            if not xzerror.is_limit(f.kind)
+                                report = report + "limit: " + xzerror.kind_name(f.kind) + "\n"
+                    // Every prefix is either refused as incomplete or as
+                    // damage, and never answered as a decode.
+                    var cut = 1
+                    while cut < bytes.len(packed)
+                        match xzdec.decompress(bytes.slice(packed, 0, cut))
+                            Ok(_)  =>
+                                report = report + "prefix ${cut} decoded\n"
+                            Err(f) =>
+                                if not xzerror.is_incomplete(f.kind) and
+                                   not xzerror.is_corrupt(f.kind)
+                                    report = report + "prefix ${cut}: " +
+                                        xzerror.kind_name(f.kind) + "\n"
+                        match xzdec.index_of(bytes.slice(packed, 0, cut))
+                            Ok(_)  =>
+                                if cut < bytes.len(packed)
+                                    report = report + "prefix ${cut} had an index\n"
+                            Err(f) => ()
+                        cut = cut + 37
+                    // Junk after a finished stream is a fault when the
+                    // caller asked for a strict tail, and nothing when it
+                    // did not.
+                    let junk = packed + bytes.from_str("junk")
+                    match xzdec.decompress(junk)
+                        Err(f)  =>
+                            if not xzerror.is_corrupt(f.kind)
+                                report = report + "junk: " + xzerror.kind_name(f.kind) + "\n"
+                        Ok(got) =>
+                            if bytes.to_hex(got) != bytes.to_hex(want)
+                                report = report + "junk: the stream did not decode\n"
+                    var ds = xzdec.with_strict_tail(xzdec.decoder())
+                    let (ds2, _) = xzdec.feed(ds, junk)
+                    match xzdec.finish(ds2)
+                        Ok(_)  =>
+                            report = report + "a strict tail accepted junk\n"
+                        Err(f) =>
+                            if xzerror.kind_name(f.kind) != "trailing-bytes"
+                                report = report + "strict tail: " + xzerror.kind_name(f.kind) + "\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+// The legacy `.lzma` stream this part decodes: `lc0.lzma`, the same file
+// `xzreal_tests.nv` pins, produced by the real `xz --format=lzma` and
+// 29,000 bytes of its output.  It is embedded again rather than shared
+// because a suite is one file.
+fn alone_hex() -> Str []
+    "5a00008000ffffffffffffffff00231cab13f62506dc217018bb8105df4c4600984360af6c6b512e9d9bfdffa8f4276dbbc843b0088fc3a08d50bd4f482272a0028c89bba8dacaa1d0c501a704970108231635f5f7d562c42f25085a8f78936824275fcecf8b744a2d4adc292b54da8e6a5778c8b1c09cf9799ed7694d85203f2f3dffff9f2e0000"
+
+// A thirteen-byte `.lzma` header with the size field written: the form
+// `xz --format=lzma` never writes, built here so the branch that reads
+// it is not reached only by a hand-built header in someone's head.
+// The properties byte is the embedded file's own — `lc = 0` — because
+// the body it will be read with was compressed under that model.
+fn alone_header_with(size: Int) -> Bytes
+    var h = bytes.zeros(13)
+    bytes.set_u8(h, 0, 0x5A)
+    bytes.set_u8(h, 3, 0x80)
+    var k = 0
+    while k < 8
+        bytes.set_u8(h, 5 + k, (size >>> (k * 8)) & 0xFF)
+        k = k + 1
+    h
+
+@test
+fn test_the_legacy_alone_reader_refuses_what_it_cannot_read() [io]
+    var report = ""
+    // Thirteen bytes, and not one fewer.
+    match xzlzma.read_alone_header(bytes.zeros(12))
+        Ok(_)  =>
+            report = report + "twelve bytes are not a header\n"
+        Err(f) =>
+            if not xzerror.is_incomplete(f.kind)
+                report = report + "twelve bytes: " + xzerror.kind_name(f.kind) + "\n"
+    // A dictionary size of zero is not a dictionary: the fault names
+    // LZMA1's filter properties, which is what a `.lzma` header is.
+    match xzlzma.read_alone_header(bytes.zeros(13))
+        Ok(_)  =>
+            report = report + "a zero-byte dictionary was accepted\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-filter-properties"
+                report = report + "zero dictionary: " + xzerror.kind_name(f.kind) + "\n"
+            if not xzerror.is_corrupt(f.kind)
+                report = report + "a zero dictionary is not damage\n"
+    // A properties byte the format does not allow.
+    match xzlzma.properties(0xFF)
+        Ok(_)  =>
+            report = report + "properties 0xFF was accepted\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-lzma-properties"
+                report = report + "properties(0xFF): " + xzerror.kind_name(f.kind) + "\n"
+    // Three parameters, each zero to four.
+    match xzlzma.properties_byte(5, 0, 2)
+        Ok(_)  =>
+            report = report + "lc five is not a parameter\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-parameter"
+                report = report + "properties_byte: " + xzerror.kind_name(f.kind) + "\n"
+    match xzlzma.properties_byte(0, 5, 2)
+        Ok(_)  =>
+            report = report + "lp five is not a parameter\n"
+        Err(f) => ()
+    match xzlzma.properties_byte(0, 0, 5)
+        Ok(_)  =>
+            report = report + "pb five is not a parameter\n"
+        Err(f) => ()
+    // Every distance slot has an extra-bit count and a base; the
+    // sixty-fourth is past the table.
+    var slot = 0
+    while slot < 64
+        match xzlzma.slot_extra_bits(slot)
+            Err(f) =>
+                report = report + "slot_extra_bits(${slot}): " + f.message() + "\n"
+            Ok(n)  => ()
+        match xzlzma.slot_base(slot)
+            Err(f) =>
+                report = report + "slot_base(${slot}): " + f.message() + "\n"
+            Ok(n)  => ()
+        slot = slot + 1
+    match xzlzma.slot_base(64)
+        Ok(_)  =>
+            report = report + "slot 64 has a base\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-parameter"
+                report = report + "slot_base(64): " + xzerror.kind_name(f.kind) + "\n"
+    match xzlzma.slot_extra_bits(64)
+        Ok(_)  =>
+            report = report + "slot 64 has extra bits\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "bad-parameter"
+                report = report + "slot_extra_bits(64): " + xzerror.kind_name(f.kind) + "\n"
+    // A distance past what the block has produced is refused before the
+    // copy, and the window is the second bound.
+    match xzlzma.check_distance(100, 10, 1000)
+        Ok(_)  =>
+            report = report + "a distance past the output was accepted\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "distance-too-far"
+                report = report + "check_distance: " + xzerror.kind_name(f.kind) + "\n"
+    match xzlzma.check_distance(100, 1000, 50)
+        Ok(_)  =>
+            report = report + "a distance past the window was accepted\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "distance-too-far"
+                report = report + "check_distance window: " + xzerror.kind_name(f.kind) + "\n"
+    match xzlzma.check_distance(5, 100, 1000)
+        Ok(n)  => ()
+        Err(f) =>
+            report = report + "a legal distance: " + f.message() + "\n"
+    // The real file: its own header, its own size, and a limit below it.
+    let alone = match bytes.from_hex(alone_hex())
+        None    =>
+            return test.fail("the embedded stream did not decode")
+        Some(b) => b
+    match xzlzma.read_alone_header(alone)
+        Err(f) =>
+            report = report + "read_alone_header: " + f.message() + "\n"
+        Ok(h)  =>
+            if xzlzma.alone_size_known(h)
+                report = report + "xz writes the unknown-size form\n"
+            if h.dict_bytes != 8388608
+                report = report + "the dictionary is ${h.dict_bytes}\n"
+    match xzlzma.decompress_alone(alone, 1000)
+        Ok(_)  =>
+            report = report + "a thousand-byte limit produced 29 KB\n"
+        Err(f) =>
+            if not xzerror.is_limit(f.kind)
+                report = report + "alone limit: " + xzerror.kind_name(f.kind) + "\n"
+    match xzlzma.decompress_alone(alone, 1048576)
+        Err(f)  =>
+            report = report + "alone: " + f.message() + "\n"
+        Ok(got) =>
+            if bytes.len(got) != 29000
+                report = report + "alone produced ${bytes.len(got)}\n"
+    // Every cut of the body is refused, never answered as a decode.
+    var cut = 13
+    while cut < bytes.len(alone)
+        match xzlzma.decompress_alone(bytes.slice(alone, 0, cut), 1048576)
+            Ok(g)  =>
+                if cut < bytes.len(alone)
+                    report = report + "a cut alone stream at ${cut} decoded\n"
+            Err(f) => ()
+        cut = cut + 29
+    // And a damaged one is refused rather than decoding to something
+    // that was never written.
+    var bad = bytes.clone(alone)
+    bytes.set_u8(bad, 40, (bytes.byte_at(bad, 40) ?? 0) ^ 0xFF)
+    match xzlzma.decompress_alone(bad, 1048576)
+        Ok(g)  =>
+            report = report + "a flipped body byte decoded to ${bytes.len(g)}\n"
+        Err(f) => ()
+    // The declared-size form: the same body, with a size in the header.
+    // A header that declares the size the body produces decodes; one
+    // that declares a size the body does not reach is a mismatch, and
+    // one that declares a size far below it is a ceiling.
+    let body = bytes.slice(alone, 13, bytes.len(alone))
+    match xzlzma.decompress_alone(alone_header_with(29000) + body, 1048576)
+        Err(f) =>
+            report = report + "declared 29000: " + f.message() + "\n"
+        Ok(g)  =>
+            if bytes.len(g) != 29000
+                report = report + "declared 29000 produced ${bytes.len(g)}\n"
+            else
+                // The same bytes the unknown-size form of the same
+                // stream answers: the header changes what the decoder
+                // knows, not what it produces.  `xz --format=lzma -dc`
+                // reads both files and answers the same 29,000 bytes.
+                match xzlzma.decompress_alone(alone, 1048576)
+                    Ok(u)  =>
+                        if bytes.to_hex(u) != bytes.to_hex(g)
+                            report = report + "the declared size changed the bytes\n"
+                    Err(f) =>
+                        report = report + "the unknown-size form: " + f.message() + "\n"
+    match xzlzma.decompress_alone(alone_header_with(29001) + body, 1048576)
+        Ok(g)  =>
+            report = report + "declared 29001 produced ${bytes.len(g)}\n"
+        Err(f) =>
+            if xzerror.kind_name(f.kind) != "size-mismatch"
+                report = report + "declared 29001: " + xzerror.kind_name(f.kind) + "\n"
+    match xzlzma.decompress_alone(alone_header_with(100) + body, 1048576)
+        Ok(_)  =>
+            report = report + "declared 100 produced 29000\n"
+        Err(f) => ()
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+@test
+fn test_the_lzma2_chunk_layer_reads_and_refuses_every_control_byte() [io]
+    var report = ""
+    // A control byte is the whole of the reset decision: which of the
+    // four resets, whether the payload is stored, and whether it ends
+    // the stream.  Every one of the 256 has an answer.
+    var c = 0
+    while c < 256
+        match xzlzma2.read_control(c)
+            Err(f)    =>
+                // The only bytes the format leaves undefined are the
+                // gap between the two uncompressed controls and the
+                // compressed range.  Every other byte is a control.
+                if c <= xzlzma2.XZ_LZMA2_UNCOMPRESSED_CONTINUE
+                        or c >= xzlzma2.XZ_LZMA2_COMPRESSED_LEAST
+                    report = report + "control ${c} was refused: " + f.message() + "\n"
+                if not xzerror.is_corrupt(f.kind)
+                    report = report + "control ${c}: " + xzerror.kind_name(f.kind) + "\n"
+            Ok(chunk) =>
+                let compressed = c >= xzlzma2.XZ_LZMA2_COMPRESSED_LEAST
+                // The flags the control byte alone decides.
+                if chunk.is_end != (c == xzlzma2.XZ_LZMA2_END)
+                    report = report + "control ${c} and is_end disagree\n"
+                if chunk.is_uncompressed !=
+                        (c == xzlzma2.XZ_LZMA2_UNCOMPRESSED_RESET
+                         or c == xzlzma2.XZ_LZMA2_UNCOMPRESSED_CONTINUE)
+                    report = report + "control ${c} and is_uncompressed disagree\n"
+                // The reset decision belongs to the compressed controls
+                // alone, and `reset_of` refuses every other byte the
+                // same way the reader just did.
+                match xzlzma2.reset_of(c)
+                    Err(f) =>
+                        if compressed
+                            report = report + "reset_of(${c}): " + f.message() + "\n"
+                    Ok(r)  =>
+                        if not compressed
+                            report = report + "reset_of(${c}) answered ${r} for an uncompressed control\n"
+                        else if r != chunk.reset
+                            report = report + "control ${c} carries reset ${chunk.reset} not ${r}\n"
+                if not compressed
+                    // An uncompressed chunk carries no properties byte
+                    // of its own, and only the first of the two
+                    // controls resets the dictionary.
+                    if chunk.props_byte != None
+                        report = report + "control ${c} carries a properties byte\n"
+                    if xzlzma2.resets_dictionary(chunk.reset)
+                            != (c == xzlzma2.XZ_LZMA2_UNCOMPRESSED_RESET)
+                        report = report + "control ${c} and its dictionary reset disagree\n"
+                if xzlzma2.resets_dictionary(chunk.reset) and chunk.is_end
+                    report = report + "an end marker resets the dictionary\n"
+                // A control byte is not a header: the sizes have not
+                // been read, so nothing but the end marker can be
+                // written back, and it is one byte.
+                match xzlzma2.chunk_header_bytes(chunk)
+                    Ok(b)  =>
+                        if not chunk.is_end
+                            report = report + "control ${c} wrote ${bytes.len(b)} bytes with no sizes\n"
+                        else
+                            match xzlzma2.read_chunk(b, 0)
+                                Ok(again) =>
+                                    if not again.is_end
+                                        report = report + "the end marker did not read back\n"
+                                Err(f)    =>
+                                    report = report + "the end marker: " + f.message() + "\n"
+                    Err(f) =>
+                        if chunk.is_end
+                            report = report + "the end marker's header: " + f.message() + "\n"
+                        else if xzerror.kind_name(f.kind) != "bad-parameter"
+                            report = report + "chunk_header_bytes(${c}): " + xzerror.kind_name(f.kind) + "\n"
+        c = c + 1
+    // A compressed chunk whose sizes have been read: the header it
+    // writes is the header that reads back, for all four reset codes.
+    var reset = 0
+    while reset < 4
+        var src = bytes.zeros(6)
+        bytes.set_u8(src, 0, xzlzma2.XZ_LZMA2_COMPRESSED_LEAST | (reset << 5))
+        bytes.set_u8(src, 1, 0x0F)
+        bytes.set_u8(src, 2, 0xFF)
+        bytes.set_u8(src, 3, 0x00)
+        bytes.set_u8(src, 4, 0x04)
+        bytes.set_u8(src, 5, 0x5D)
+        match xzlzma2.read_chunk(src, 0)
+            Err(f)    =>
+                report = report + "read_chunk reset ${reset}: " + f.message() + "\n"
+            Ok(chunk) =>
+                if chunk.uncompressed_size != 4096 or chunk.compressed_size != 5
+                    report = report + "reset ${reset}: sizes ${chunk.uncompressed_size}/" +
+                        "${chunk.compressed_size}\n"
+                match xzlzma2.chunk_header_bytes(chunk)
+                    Err(f) =>
+                        report = report + "write reset ${reset}: " + f.message() + "\n"
+                    Ok(b)  =>
+                        match xzlzma2.read_chunk(b, 0)
+                            Err(f)    =>
+                                report = report + "read back reset ${reset}: " + f.message() + "\n"
+                            Ok(again) =>
+                                if again.uncompressed_size != chunk.uncompressed_size
+                                        or again.compressed_size != chunk.compressed_size
+                                        or again.reset != chunk.reset
+                                    report = report + "reset ${reset} did not read back\n"
+                                if xzlzma2.carries_properties(reset) != (again.props_byte != None)
+                                    report = report + "reset ${reset}: the properties disagree\n"
+        reset = reset + 1
+    // A chunk header that runs out of bytes is incomplete, not damage.
+    match xzlzma2.read_chunk(bytes.zeros(0), 0)
+        Ok(_)  =>
+            report = report + "no bytes are not a chunk\n"
+        Err(f) =>
+            if not xzerror.is_incomplete(f.kind)
+                report = report + "no bytes: " + xzerror.kind_name(f.kind) + "\n"
+    // The end marker is a whole chunk in one byte, and it is the only
+    // one-byte header there is.
+    match xzlzma2.read_chunk(bytes.zeros(1), 0)
+        Ok(c)  =>
+            if not c.is_end or c.header_bytes != 1
+                report = report + "a zero byte is not the end marker\n"
+        Err(f) =>
+            report = report + "the end marker: " + f.message() + "\n"
+    // A compressed chunk header is five bytes, so four is short of one.
+    match xzlzma2.read_chunk(bytes.from_hex("80000000") ?? bytes.zeros(4), 0)
+        Ok(_)  =>
+            report = report + "a four-byte compressed header is complete\n"
+        Err(f) =>
+            if not xzerror.is_incomplete(f.kind)
+                report = report + "short compressed: " + xzerror.kind_name(f.kind) + "\n"
+    // The dictionary and the probability array are the caller's, sized
+    // before anything is committed.
+    var dict = bytes.zeros(65536)
+    var probs = bytes.zeros(28268)
+    match xzlzma2.decoder(dict, probs)
+        Err(f) =>
+            report = report + "decoder: " + f.message() + "\n"
+        Ok(st) =>
+            // The very first chunk of a stream has to reset the
+            // dictionary: a continuation with nothing to continue is
+            // refused.
+            match xzlzma2.decode_chunk(st, bytes.from_hex("8000") ?? bytes.zeros(2), 0)
+                Ok(_)  =>
+                    report = report + "a continuation with no dictionary decoded\n"
+                Err(f) => ()
+            // A stored chunk whose payload is shorter than the size its
+            // header declares is incomplete.
+            match xzlzma2.decode_chunk(st, bytes.from_hex("01000a31323334") ?? bytes.zeros(7), 0)
+                Ok(_)  =>
+                    report = report + "a short stored chunk decoded\n"
+                Err(f) => ()
+            // An end marker carries nothing after its control byte.
+            match xzlzma2.decode_chunk(st, bytes.from_hex("0001") ?? bytes.zeros(2), 0)
+                Ok(_)  =>
+                    report = report + "an end marker with a payload was accepted\n"
+                Err(f) => ()
+            // A stored chunk larger than the dictionary has nowhere to
+            // go.
+            match xzlzma2.decode_chunk(st, bytes.from_hex("0100ff") ?? bytes.zeros(3), 0)
+                Ok(_)  =>
+                    report = report + "a 65536-byte chunk in a 64 KiB dictionary\n"
+                Err(f) => ()
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+@test
+fn test_every_branch_converter_is_its_own_inverse_on_its_own_instructions() [io]
+    // The property a converter has to have on EVERY input, and the one
+    // that matters more than any vector: decoding what it encoded gives
+    // back the bytes, whatever the architecture's instruction encoding
+    // looks like.  The buffers below carry the instruction shapes each
+    // converter looks for, so the architecture-specific arms run.
+    let ids = [xzfilter.XZ_FILTER_X86, xzfilter.XZ_FILTER_POWERPC, xzfilter.XZ_FILTER_IA64,
+               xzfilter.XZ_FILTER_ARM, xzfilter.XZ_FILTER_ARMTHUMB, xzfilter.XZ_FILTER_SPARC,
+               xzfilter.XZ_FILTER_ARM64, xzfilter.XZ_FILTER_RISCV]
+    let shapes = [
+        "e801000000e9feffffff90e800000000",
+        "48000001480000014800000148000001",
+        "170000000000000000000000000000001800000000000000000000000000000019000000000000000000000000000000",
+        "eb00000a0100000aebffffff0100000a",
+        "f000f80001000000f000f80001000000",
+        "40000000010000004000000001000000",
+        "94000000010000009400000001000000",
+        "17010200000000001701020000000000"]
+    var report = ""
+    for i in 0..8
+        match xzfilter.branch(ids[i], 0)
+            Err(f)   =>
+                report = report + "${i}: " + f.message() + "\n"
+            Ok(conv) =>
+                let shape = bytes.from_hex(shapes[i]) ?? bytes.zeros(0)
+                if bytes.len(shape) == 0
+                    report = report + "${i}: the shape did not decode\n"
+                // The same buffer goes in and comes back: encode it,
+                // then decode the bytes that came out.
+                var work = bytes.clone(shape)
+                match xzfilter.encode_in_place(conv, work, 0, bytes.len(work))
+                    Err(f) =>
+                        report = report + "${i}: encode: " + f.message() + "\n"
+                    Ok(_)  =>
+                        match xzfilter.decode_in_place(conv, work, 0, bytes.len(work))
+                            Err(f) =>
+                                report = report + "${i}: decode: " + f.message() + "\n"
+                            Ok(_)  =>
+                                if bytes.to_hex(work) != bytes.to_hex(shape)
+                                    report = report + "${i}: a converter is not its own inverse: " +
+                                        bytes.to_hex(shape) + " -> ${bytes.to_hex(work)}\n"
+                // A one-byte shorter destination cannot hold a four-byte
+                // instruction, and the answer is a limit rather than a
+                // half-written buffer.
+                var small = bytes.zeros(1)
+                match xzfilter.encode_in_place(conv, small, 0, 4)
+                    Ok(_)  =>
+                        report = report + "${i}: a one-byte destination took four\n"
+                    Err(f) => ()
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+// Pseudo-random bytes with a fixed seed: the sweep below needs the same
+// buffers on every run, and a buffer that differs per run would make a
+// failure unreproducible.
+fn swept(n: Int, salt: Int) -> Bytes
+    var b = bytes.zeros(n)
+    var x = salt & 0x7FFFFFFF
+    var i = 0
+    while i < n
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        bytes.set_u8(b, i, (x >>> 9) & 0xFF)
+        i = i + 1
+    b
+
+@test
+fn test_every_converter_is_its_own_inverse_on_a_sweep_of_shapes() [io]
+    // The eight shapes above are hand-made, and a hand-made shape only
+    // reaches the arm its author thought of.  This sweep feeds every
+    // converter 240 pseudo-random buffers salted with the bytes that
+    // architecture's arm looks for — so the instruction decoders, the
+    // x86 mask table and the IA-64 template table run on thousands of
+    // inputs rather than on eight — and asks the one question a vector
+    // cannot: decode(encode(x)) == x, for every x.
+    let ids = [xzfilter.XZ_FILTER_X86, xzfilter.XZ_FILTER_POWERPC, xzfilter.XZ_FILTER_IA64,
+               xzfilter.XZ_FILTER_ARM, xzfilter.XZ_FILTER_ARMTHUMB, xzfilter.XZ_FILTER_SPARC,
+               xzfilter.XZ_FILTER_ARM64, xzfilter.XZ_FILTER_RISCV]
+    let salts = [0xE8, 0x48, 0x17, 0xEB, 0xF0, 0x40, 0x94, 0xEF]
+    var report = ""
+    for i in 0..8
+        match xzfilter.branch(ids[i], 0)
+            Err(f)   =>
+                report = report + "${i}: " + f.message() + "\n"
+            Ok(conv) =>
+                var bad = 0
+                var first = ""
+                var round = 0
+                while round < 240
+                    var b = swept(32, round * 37 + i + 1)
+                    var salt = salts[i]
+                    if i == 2
+                        // IA-64's arm dispatches on the bundle's low
+                        // five bits, so every template is walked.
+                        salt = 0x10 + (round & 0x0F)
+                    var at = 0
+                    while at < 32
+                        // The salt at every sixth byte, and the four
+                        // values that make the other arms run beside
+                        // it: a zero and an all-ones byte for the x86
+                        // sign test, and the two bytes an 0xEF looks
+                        // at in the RISC-V taker.
+                        let pick = (round + at) % 6
+                        if pick == 0
+                            bytes.set_u8(b, at, salt)
+                        else if pick == 1
+                            bytes.set_u8(b, at, 0x00)
+                        else if pick == 2
+                            bytes.set_u8(b, at, 0xFF)
+                        else if pick == 3
+                            bytes.set_u8(b, at, 0x0D)
+                        else if pick == 4
+                            bytes.set_u8(b, at, 0x01)
+                        else
+                            bytes.set_u8(b, at, 0xEF)
+                        at = at + 1
+                    let want = bytes.to_hex(b)
+                    var work = bytes.clone(b)
+                    match xzfilter.encode_in_place(conv, work, 0, bytes.len(work))
+                        Err(f) =>
+                            report = report + "${i}: encode: " + f.message() + "\n"
+                        Ok(_)  =>
+                            match xzfilter.decode_in_place(conv, work, 0, bytes.len(work))
+                                Err(f) =>
+                                    report = report + "${i}: decode: " + f.message() + "\n"
+                                Ok(_)  =>
+                                    if bytes.to_hex(work) != want
+                                        bad = bad + 1
+                                        if first == ""
+                                            first = want + " -> ${bytes.to_hex(work)}"
+                    round = round + 1
+                if bad != 0
+                    report = report + "${i}: ${bad} of 240 did not round trip, first ${first}\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+@test
+fn test_the_layer_numbers_are_pinned_because_a_caller_writes_them_down() [io]
+    // The container suite asserts `layer_name(CONST) == "name"`, which
+    // moves both sides of every assertion if a number is edited.  What
+    // a caller holds is the NUMBER: `XzWhere.layer` is an int a program
+    // compares, sorts and logs, so the seven numbers are published
+    // surface and not a private encoding.
+    test.case("the seven layers number 0 through 6")
+    test.assert(xzerror.XZ_LAYER_STREAM == 0)
+    test.assert(xzerror.XZ_LAYER_BLOCK == 1)
+    test.assert(xzerror.XZ_LAYER_INDEX == 2)
+    test.assert(xzerror.XZ_LAYER_FILTER == 3)
+    test.assert(xzerror.XZ_LAYER_LZMA2 == 4)
+    test.assert(xzerror.XZ_LAYER_LZMA == 5)
+    test.assert(xzerror.XZ_LAYER_CHECK == 6)
+
+    test.case("a number answers the name of the layer it numbers")
+    test.assert(xzerror.layer_name(0) == "stream")
+    test.assert(xzerror.layer_name(1) == "block")
+    test.assert(xzerror.layer_name(2) == "index")
+    test.assert(xzerror.layer_name(3) == "filter")
+    test.assert(xzerror.layer_name(4) == "lzma2")
+    test.assert(xzerror.layer_name(5) == "lzma")
+    test.assert(xzerror.layer_name(6) == "check")
+
+    test.case("a number no layer has answers unknown rather than a wrong name")
+    test.assert(xzerror.layer_name(7) == "unknown")
+    test.assert(xzerror.layer_name(-1) == "unknown")
+
+    test.case("a position carries the number it was given")
+    let w = xzerror.here(0, 0, xzerror.XZ_LAYER_CHECK)
+    test.assert(w.layer == 6)

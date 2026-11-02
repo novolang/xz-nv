@@ -1,0 +1,375 @@
+use std.bytes
+use std.test
+use xzenc
+use xzdec
+use xzerror
+use xzcheck
+use xzfilter
+use xzstream
+use xzindex
+
+// The encoder's suite: the pinned streams, the container it builds
+// around them, and the round trip at every setting a caller can ask
+// for.
+//
+// EVERY VECTOR BELOW WAS HANDED TO THE REAL `xz -d`, which answered the
+// bytes it was made from.  None of them was accepted because this
+// package's own decoder agreed — `xz -dc vectors/*.xz` is a separate
+// program with a separate implementation, and it is the reason these
+// four strings are an oracle rather than a snapshot.
+
+// Deterministic content with long-range structure: a phrase repeated to
+// the end, so the match finder has matches at a distance it must
+// encode rather than only overlap at one.
+fn textish(n: Int) -> Bytes
+    let words = bytes.from_str("the xz format is a container for lzma2 and lzma1 and crc64 ")
+    var b = bytes.zeros(n)
+    var i = 0
+    while i < n
+        bytes.set_u8(b, i, bytes.byte_at(words, i % bytes.len(words)) ?? 0)
+        i = i + 1
+    b
+
+// Deterministic content with no usable structure, a linear congruential
+// sequence masked to thirty-one bits: the literal path's side of the
+// encoder, where nothing matches and every byte costs a tree.
+fn busy(n: Int) -> Bytes
+    var b = bytes.zeros(n)
+    var x = 1
+    var i = 0
+    while i < n
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        bytes.set_u8(b, i, (x >>> 7) & 0xFF)
+        i = i + 1
+    b
+
+// Deterministic content with no repeat at any distance a window can
+// hold: a 32-bit xorshift, whose period is 2^32 - 1.
+//
+// `busy` is not this.  A linear congruential generator's low bits carry
+// a period of their own — bits 7 to 14 of a 31-bit sequence repeat
+// every 32,768 steps — so `busy` compresses five to one out of a
+// repeat INSIDE the window, and a test built on a repeat at 180,000
+// bytes could not tell a 256 KiB window from a 128 KiB one.  This
+// generator has a full-period bit in every byte position, so the only
+// repeat in `s + s` is the one the test put there.
+fn scrambler(n: Int) -> Bytes
+    var b = bytes.zeros(n)
+    var x = 2463534242
+    var i = 0
+    while i < n
+        x = x ^ ((x << 13) & 0xFFFFFFFF)
+        x = x ^ (x >>> 17)
+        x = x ^ ((x << 5) & 0xFFFFFFFF)
+        x = x & 0xFFFFFFFF
+        bytes.set_u8(b, i, x & 0xFF)
+        i = i + 1
+    b
+
+// A run of one byte with a few others in it: the long-match path, and
+// the rep path once the first distance is remembered.
+fn runs(n: Int) -> Bytes
+    var b = bytes.zeros(n)
+    var at = 0
+    while at < n
+        bytes.set_u8(b, at, (at / 977) & 0xFF)
+        at = at + 997
+    b
+
+// The empty answer is a round trip that came back byte for byte.
+fn round_trip(want: Bytes, s: XzSettings) -> Str
+    match xzenc.compress_with(want, s)
+        Err(f)     => "compress: " + f.message()
+        Ok(packed) =>
+            match xzdec.decompress(packed)
+                Err(f)  => "decompress: " + f.message()
+                Ok(got) =>
+                    if bytes.to_hex(got) == bytes.to_hex(want)
+                        ""
+                    else
+                        "got " + "${bytes.len(got)}" + " of " + "${bytes.len(want)}" + " bytes"
+
+fn settings_with(block: Int) -> Result<XzSettings, XzFault> []
+    let s = match xzenc.settings(6)
+        Err(f) =>
+            return Err(f)
+        Ok(x)  => x
+    xzenc.with_block_bytes(s, block)
+
+@test
+fn test_the_streams_the_encoder_writes_are_the_ones_xz_accepts() [io]
+    // `hello`, preset 6: the smallest complete stream there is, with a
+    // block header carrying both sizes, one LZMA2 chunk and CRC-64.
+    match xzenc.compress(bytes.from_str("hello"))
+        Err(f) => test.fail("compress: " + f.message())
+        Ok(b)  =>
+            test.assert(bytes.to_hex(b) ==
+                "fd377a585a000004e6d6b44602c0100521011600cfddf825e0000400085d0034" +
+                "1949ee8dd7800000b137b9dbe5da1e9b0001240502a004a11fb6f37d010000000004595a")
+    // The empty input writes NO block at all: a header, an empty index
+    // and a footer, thirty-two bytes, which is what `xz` writes too.
+    let s6 = match xzenc.settings(6)
+        Err(f) =>
+            return test.fail("settings: " + f.message())
+        Ok(x)  => x
+    match xzenc.compress_with(bytes.zeros(0), s6)
+        Err(f) => test.fail("compress empty: " + f.message())
+        Ok(b)  =>
+            test.assert(bytes.to_hex(b) ==
+                "fd377a585a000004e6d6b446000000001cdf44211fb6f37d010000000004595a")
+    // A block size below the content's size, so the stream has more than
+    // one block and the index has more than one record.
+    match settings_with(4096)
+        Err(f) => test.fail("settings: " + f.message())
+        Ok(s)  =>
+            match xzenc.compress_with(bytes.from_str("xyzzy-"), s)
+                Err(f) => test.fail("compress: " + f.message())
+                Ok(b)  =>
+                    test.assert(bytes.to_hex(b) ==
+                        "fd377a585a000004e6d6b44602c01206210116001406902fe00005000a5d003c" +
+                        "1e4bc1500edbec0000000000d0d2e36f2ab37f73000126063a933b0a1fb6f37d010000000004595a")
+    // And one through the delta converter, so the vector covers a
+    // filter that has to be undone before the check is taken.
+    match xzfilter.delta(1)
+        Err(f) => test.fail("delta: " + f.message())
+        Ok(d)  =>
+            match xzenc.settings(6)
+                Err(f) => test.fail("settings: " + f.message())
+                Ok(s0) =>
+                    match xzenc.with_filters(s0, [d, s0.filters[0]])
+                        Err(f) => test.fail("with_filters: " + f.message())
+                        Ok(s)  =>
+                            match xzenc.compress_with(
+                                    bytes.from_str("0123456789abcdef"), s)
+                                Err(f) => test.fail("compress delta: " + f.message())
+                                Ok(b)  =>
+                                    test.assert(bytes.to_hex(b) ==
+                                        "fd377a585a000004e6d6b44603c112100301002101160000cf46b997e0000f00" +
+                                        "0a5d001800718508fcb80000000000006c006b97fc22e73300012a1067695a521fb6f37d010000000004595a")
+
+@test
+fn test_the_container_around_the_block_is_what_the_format_says() [io]
+    let packed = match xzenc.compress(bytes.from_str("hello"))
+        Err(f) =>
+            return test.fail("compress: " + f.message())
+        Ok(b)  => b
+    // The header: `.xz` magic, CRC-64 for the stream, and the flags read
+    // back by the released reader rather than by a byte comparison.
+    match xzstream.read_header(packed)
+        Err(f) => test.fail("read_header: " + f.message())
+        Ok(h)  => test.assert(xzstream.check_of(h) == xzcheck.XZ_CHECK_CRC64)
+    // The footer: it records the index's size, and the two copies of the
+    // stream flags agree — the header's was read above.
+    var index_bytes = 0
+    match xzstream.read_footer(bytes.slice(packed, bytes.len(packed) - 12, bytes.len(packed)))
+        Err(f) => test.fail("read_footer: " + f.message())
+        Ok(f0) =>
+            test.assert(f0.index_bytes > 0)
+            index_bytes = f0.index_bytes
+    // The index: one record, its unpadded size the block's own header
+    // plus its data plus its check, and its uncompressed size the five
+    // bytes that went in.  The footer said how long the index is, so the
+    // block occupies everything between the two twelve-byte ends that the
+    // index does not.
+    match xzdec.index_of(packed)
+        Err(f)  => test.fail("index_of: " + f.message())
+        Ok(idx) =>
+            test.assert(xzindex.block_count(idx) == 1)
+            test.assert(xzindex.total_uncompressed(idx) == 5)
+            test.assert(xzindex.total_compressed(idx) ==
+                        bytes.len(packed) - 24 - index_bytes)
+    // The block twice over: the same stream read as one block and as the
+    // whole file must answer the same bytes.  The block starts after the
+    // twelve-byte stream header, which is the offset an index record's
+    // unpadded sizes let a reader compute without decoding anything.
+    match xzdec.decompress_block(packed, 12, 8388608)
+        Err(f) => test.fail("decompress_block: " + f.message())
+        Ok(b)  => test.assert(bytes.to_hex(b) == bytes.to_hex(bytes.from_str("hello")))
+
+@test
+fn test_every_preset_round_trips_every_shape_of_content() [io]
+    var report = ""
+    let presets = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    for i in 0..10
+        match xzenc.settings(presets[i])
+            Err(f) =>
+                report = report + "settings: " + f.message() + "\n"
+            Ok(s)  =>
+                let cases = [textish(60000), busy(20000), runs(30000), bytes.zeros(1),
+                             bytes.from_str("hello"), bytes.zeros(0)]
+                for k in 0..list.len(cases)
+                    let bad = round_trip(cases[k], s)
+                    if bad != ""
+                        report = report + "preset " + "${presets[i]}" + " case " +
+                            "${k}" + ": " + bad + "\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+@test
+fn test_a_block_size_splits_the_stream_and_the_index_counts_the_blocks() [io]
+    var report = ""
+    let want = textish(50000)
+    let sizes = [4096, 8192, 16384, 65536, -1]
+    for i in 0..list.len(sizes)
+        match settings_with(sizes[i])
+            Err(f) =>
+                report = report + "settings: " + f.message() + "\n"
+            Ok(s)  =>
+                let bad = round_trip(want, s)
+                if bad != ""
+                    report = report + "block " + "${sizes[i]}" + ": " + bad + "\n"
+                match xzenc.compress_with(want, s)
+                    Err(f)     =>
+                        report = report + "compress: " + f.message() + "\n"
+                    Ok(packed) =>
+                        match xzdec.index_of(packed)
+                            Err(f)  =>
+                                report = report + "index_of: " + f.message() + "\n"
+                            Ok(idx) =>
+                                let want_blocks = if sizes[i] < 0
+                                    1
+                                else
+                                    (bytes.len(want) + sizes[i] - 1) / sizes[i]
+                                if xzindex.block_count(idx) != want_blocks
+                                    report = report + "block " + "${sizes[i]}" + ": index says " +
+                                        "${xzindex.block_count(idx)}" + " not " +
+                                        "${want_blocks}" + "\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+@test
+fn test_pushing_in_pieces_is_the_one_shot_form() [io]
+    let want = textish(20000)
+    var report = ""
+    let pieces = [1, 4095, 4096, 4097, 60000]
+    for i in 0..list.len(pieces)
+        match settings_with(4096)
+            Err(f) =>
+                report = report + "settings: " + f.message() + "\n"
+            Ok(s)  =>
+                var e = xzenc.encoder(s)
+                var out = bytes.zeros(0)
+                var at = 0
+                while at < bytes.len(want)
+                    let (next, part) = xzenc.push(e, bytes.slice(want, at, at + pieces[i]))
+                    e = next
+                    out = out + part
+                    at = at + pieces[i]
+                match xzenc.close(e)
+                    Err(f)   =>
+                        report = report + "close: " + f.message() + "\n"
+                    Ok(tail) =>
+                        let joined = out + tail
+                        if xzenc.total_in(e) != bytes.len(want)
+                            report = report + "piece ${pieces[i]}: total_in\n"
+                        match xzdec.decompress(joined)
+                            Err(f)  =>
+                                report = report + "piece ${pieces[i]}: " + f.message() + "\n"
+                            Ok(got) =>
+                                if bytes.to_hex(got) != bytes.to_hex(want)
+                                    report = report + "piece ${pieces[i]}: differs\n"
+                                else
+                                    match xzenc.compress_with(want, s)
+                                        Err(f)    =>
+                                            report = report + "one-shot: " + f.message() + "\n"
+                                        Ok(whole) =>
+                                            if bytes.to_hex(whole) != bytes.to_hex(joined)
+                                                report = report + "piece ${pieces[i]}: " +
+                                                    "the pieces and the one-shot form differ\n"
+    if report != ""
+        test.fail(report)
+    test.assert(true)
+
+@test
+fn test_the_encoder_refuses_what_it_cannot_write() [io]
+    // A preset outside the nine the format has levels for.
+    match xzenc.settings(10)
+        Ok(_)  => test.fail("preset ten is not a preset")
+        Err(f) =>
+            test.assert(xzerror.kind_name(f.kind) == "bad-parameter")
+            test.assert(not xzerror.is_corrupt(f.kind))
+            test.assert(not xzerror.is_unsupported(f.kind))
+    // A block size below the floor, and the one value that means "one
+    // block for everything".
+    match settings_with(4095)
+        Ok(_)  => test.fail("a block smaller than a page is mostly container")
+        Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-parameter")
+    match settings_with(4096)
+        Ok(s)  => test.assert(s.block_bytes == 4096)
+        Err(f) => test.fail("4096 is at the floor: " + f.message())
+    // An empty chain has no compression filter in it, which the chain
+    // rules already name.
+    match xzenc.settings(6)
+        Err(f) => test.fail("settings: " + f.message())
+        Ok(s)  =>
+            match xzenc.with_filters(s, [])
+                Ok(_)  => test.fail("an empty chain is not a chain")
+                Err(f) => test.assert(xzerror.kind_name(f.kind) == "bad-filter-chain")
+            // A check type the format reserves is refused by `close` on
+            // an EMPTY stream too, which is the case with no block to
+            // build a check for.  Writing one anyway produces a file the
+            // reference decoder will not read: `xz -lvv` lists it as
+            // `Unknown-9` and `xz -dc` answers `Unsupported type of
+            // integrity check` and exits 2, so a stream this package
+            // wrote would be one a user could not open.  `push` takes no
+            // answer to put a fault in, so it holds the content instead
+            // and the block's own check refuses it here.
+            match xzenc.close(xzenc.encoder(xzenc.with_check(s, 9)))
+                Ok(_)  => test.fail("check type nine is not a check this engine has")
+                Err(f) =>
+                    test.assert(xzerror.kind_name(f.kind) == "unsupported-check")
+                    test.assert(not xzerror.is_corrupt(f.kind))
+            let held = xzenc.encoder(xzenc.with_check(s, 9))
+            let (held2, _) = xzenc.push(held, bytes.from_str("hello"))
+            match xzenc.close(held2)
+                Ok(_)  => test.fail("a reserved check is still reserved with content")
+                Err(f) => test.assert(xzerror.is_unsupported(f.kind))
+            // The same settings with a check this engine does have are
+            // written, and the stream says so.
+            match xzenc.close(xzenc.encoder(xzenc.with_check(s, xzcheck.XZ_CHECK_CRC32)))
+                Ok(b)  => test.assert(bytes.len(b) == 32)
+                Err(f) => test.fail("crc32 close: " + f.message())
+    // The bound is above the input, because `.xz` can expand.
+    test.assert(xzenc.compress_bound(1048576) > 1048576)
+    test.assert(xzenc.compress_bound(0) > 0)
+
+// The distance the match finder reaches is the window the block will
+// declare, and the block header is what bounds a decoder — so an
+// encoder that coded only the distances half its own window holds
+// would still produce legal streams, and this is the test that says it
+// does not.
+//
+// Two copies of `scrambler` content back to back hold exactly one
+// repeat: the second copy, at a distance of 180,000 bytes, inside the
+// 256 KiB this encoder's window holds and outside half of it.  Neither
+// copy compresses on its own — the first is 182,760 bytes of the
+// 180,000 it started as — so a second copy coded as literals costs a
+// whole second copy, measured.  Against the encoder's own one-copy
+// figure the bound is four times the margin it needs: the copy is
+// found, or the test says the window did not reach.
+@test
+fn test_the_match_finder_reaches_the_window_the_block_declares() [io]
+    let half = 180000
+    let one = scrambler(half)
+    let want = one + one
+    match xzenc.settings(6)
+        Err(f) => test.fail("settings: " + f.message())
+        Ok(s)  =>
+            let bad = round_trip(want, s)
+            if bad != ""
+                test.fail("round trip: " + bad)
+            match xzenc.compress_with(one, s)
+                Err(f)     => test.fail("one copy: " + f.message())
+                Ok(single) =>
+                    match xzenc.compress_with(want, s)
+                        Err(f)     => test.fail("two copies: " + f.message())
+                        Ok(packed) =>
+                            let one_n = bytes.len(single)
+                            let two_n = bytes.len(packed)
+                            if two_n > one_n + one_n / 4
+                                test.fail("the copy of ${half} bytes at a distance of " +
+                                    "${half} was not coded as matches: two copies are " +
+                                    "${two_n} bytes and one is ${one_n}")
+                            test.assert(true)

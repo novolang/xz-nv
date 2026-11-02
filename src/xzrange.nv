@@ -1,9 +1,6 @@
 // xzrange.nv — the binary range decoder LZMA is built on, as two
 // integers and a caller's probability array.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // WHAT A RANGE CODER IS.  An arithmetic coder over single bits.  The
 // decoder holds an interval — `range`, a 32-bit width — and a `code`
 // somewhere inside it.  Each bit is decoded by splitting the interval
@@ -34,6 +31,41 @@
 // for the same reason.
 
 use xzerror
+
+// One byte of a source, or zero past its end: the callers below have
+// already bounded what they read.
+fn byte_of(src: Bytes, k: Int) -> Int
+    bytes.byte_at(src, k) ?? 0
+
+// The low 32 bits of an integer, which is what every field in the
+// coder wraps at.
+fn u32(n: Int) -> Int
+    n & 0xFFFFFFFF
+
+// The probability at index `i` of a caller's array: two bytes, little
+// endian, eleven significant bits.
+//
+// THE GUARD IS THE SAME RULE `byte_of` FOLLOWS.  The array is the
+// caller's and `probability_count` says how big it must be; a caller
+// that passed a shorter one gets the value an unadapted probability
+// would hold rather than an abort.  Zero would be the wrong default
+// here — in this model zero means "certainly a one", not "no
+// information" — and 1024 is what a fresh array holds.
+fn prob_read(probs: Bytes, i: Int) -> Int
+    if i < 0 or i * 2 + 1 >= bytes.len(probs)
+        return XZ_PROB_INIT
+    byte_of(probs, i * 2) | (byte_of(probs, i * 2 + 1) << 8)
+
+// Write one back where it came from, if it came from inside the array.
+//
+// A short array is tolerated on the read side, so it must be tolerated
+// on the write side too: the read answered a value the caller did not
+// store, and there is nowhere to put the adapted one.
+fn prob_write(var probs: Bytes, i: Int, v: Int)
+    if i < 0 or i * 2 + 1 >= bytes.len(probs)
+        return
+    bytes.set_u8(probs, i * 2, v)
+    bytes.set_u8(probs, i * 2 + 1, v >>> 8)
 
 // The width of a probability, in bits: 11.
 pub const XZ_PROB_BITS = 11
@@ -102,7 +134,18 @@ struct XzRange
 //     println("${xzrange.start(bytes.zeros(5), 0).consumed}")
 // ```
 pub fn start(src: Bytes, off: Int) -> XzRange []
-    todo("xz-nv.xzrange.start")
+    let bad = XzRange { range: 0, code: 0, consumed: 0, ok: false }
+    if off < 0 or bytes.len(src) - off < XZ_RANGE_INIT_BYTES
+        return bad
+    if byte_of(src, off) != 0
+        return bad
+    // The four bytes after the zero one, big-endian, are the code.
+    var code = 0
+    var k = 1
+    while k < XZ_RANGE_INIT_BYTES
+        code = u32((code << 8) | byte_of(src, off + k))
+        k = k + 1
+    XzRange { range: 0xFFFFFFFF, code: code, consumed: XZ_RANGE_INIT_BYTES, ok: true }
 
 // The fault a `start` that answered `ok == false` should be reported
 // as, or `None`.
@@ -121,7 +164,10 @@ pub fn start(src: Bytes, off: Int) -> XzRange []
 //         None    => println("started cleanly")
 // ```
 pub fn start_fault(r: XzRange, off: Int) -> ?XzFault []
-    todo("xz-nv.xzrange.start_fault")
+    if r.ok
+        return None
+    Some(xzerror.fault(XzBadRangeCoder(off),
+                       xzerror.here(-1, off, xzerror.XZ_LAYER_LZMA)))
 
 // What one bit decode produced.
 //
@@ -137,6 +183,98 @@ struct XzRangeStep
     // caller writes it back into its own array at the index it read it
     // from; this module never holds one.
     prob: Int
+
+// Read the next source byte if the interval has fallen below the top:
+// the `rc_normalize` every form of decode starts with.
+//
+// One shift is enough, and the reason is the model's own range: after
+// any bit the interval is at least `2^24 * 31 / 2048`, so one eight-bit
+// shift always puts it back above `2^24`.
+fn normalized(r: XzRange, src: Bytes, off: Int) -> XzRange
+    if not r.ok
+        return r
+    if r.range >= XZ_RANGE_TOP
+        return r
+    if off + r.consumed >= bytes.len(src)
+        return XzRange { range: r.range, code: r.code,
+                         consumed: r.consumed, ok: false }
+    XzRange {
+        range: u32(r.range << 8),
+        code: u32((r.code << 8) | byte_of(src, off + r.consumed)),
+        consumed: r.consumed + 1,
+        ok: true }
+
+// One bit decode: the normalization first, then the interval split.
+//
+// Private because every public answer is a step: `decode_bit` is this
+// one call, the two trees are it in a loop, and `decode_direct` is its
+// probability-free twin below.
+//
+// An `ok` coder that has run out of source answers a step whose coder
+// is no longer `ok`, which is how the symbol loop above hears about it.
+fn bit_step(r: XzRange, prob: Int, src: Bytes, off: Int) -> XzRangeStep
+    let coder = normalized(r, src, off)
+    if not coder.ok
+        return XzRangeStep { coder: coder, bit: 0, prob: prob }
+    let bound = (coder.range >>> XZ_PROB_BITS) * prob
+    if coder.code < bound
+        XzRangeStep {
+            coder: XzRange { range: bound, code: coder.code,
+                             consumed: coder.consumed, ok: true },
+            bit: 0,
+            prob: adapt(prob, 0) }
+    else
+        XzRangeStep {
+            coder: XzRange { range: coder.range - bound,
+                             code: coder.code - bound,
+                             consumed: coder.consumed, ok: true },
+            bit: 1,
+            prob: adapt(prob, 1) }
+
+// One direct bit: the interval is split in half and no probability is
+// involved.  The C's `rc_direct`, including its trick of reading the
+// borrow out of the sign bit.
+fn direct_step(r: XzRange, src: Bytes, off: Int) -> XzRangeStep
+    let coder = normalized(r, src, off)
+    if not coder.ok
+        return XzRangeStep { coder: coder, bit: 0, prob: 0 }
+    let half = coder.range >>> 1
+    if coder.code >= half
+        XzRangeStep {
+            coder: XzRange { range: half, code: coder.code - half,
+                             consumed: coder.consumed, ok: true },
+            bit: 1,
+            prob: 0 }
+    else
+        XzRangeStep {
+            coder: XzRange { range: half, code: coder.code,
+                             consumed: coder.consumed, ok: true },
+            bit: 0,
+            prob: 0 }
+
+// A bit tree of `n` levels, forwards or backwards.
+//
+// One function because the two differ in one line: the tree walks
+// `m = 2m + bit` either way, and only the symbol being assembled
+// changes — high bit first for the forward tree, low bit first for the
+// reverse one, which is how LZMA reads a distance's aligned low bits.
+fn tree_step(r: XzRange, n: Int, var probs: Bytes, at: Int, src: Bytes, off: Int,
+             forward: Bool) -> XzRangeStep
+    var coder = r
+    var m = 1
+    var symbol = 0
+    var k = 0
+    while k < n and coder.ok
+        let step = bit_step(coder, prob_read(probs, at + m), src, off)
+        coder = step.coder
+        prob_write(var probs, at + m, step.prob)
+        m = m * 2 + step.bit
+        if forward
+            symbol = symbol * 2 + step.bit
+        else
+            symbol = symbol | (step.bit << k)
+        k = k + 1
+    XzRangeStep { coder: coder, bit: symbol, prob: 0 }
 
 // Decode one bit against a probability, and answer the adapted
 // probability beside it.
@@ -155,7 +293,30 @@ struct XzRangeStep
 //     println("${s.bit}")
 // ```
 pub fn decode_bit(r: XzRange, prob: Int, src: Bytes, off: Int) -> XzRangeStep []
-    todo("xz-nv.xzrange.decode_bit")
+    bit_step(r, prob, src, off)
+
+// Bring the coder above the normalisation threshold, reading the next
+// source byte if it is below it, and answer the coder.
+//
+// THE CALL THAT ENDS AN LZMA2 CHUNK.  A chunk knows how many bytes it
+// produces, so the decoder stops there — but the coder may still be
+// holding an interval narrow enough to need one more byte, and the
+// reference decoder reads it anyway ("in rare cases there is a useless
+// byte that needs to be read anyway") before asking whether the coder
+// came to rest.  A decoder that skips this call consumes one source
+// byte fewer than the chunk says it holds, and rejects a file every
+// other decoder accepts.
+//
+// ```novo
+// use std.bytes
+// use xzrange
+//
+// fn main() [io]
+//     println("${xzrange.normalize(xzrange.start(bytes.zeros(5), 0),
+//                                  bytes.zeros(16), 0).consumed}")
+// ```
+pub fn normalize(r: XzRange, src: Bytes, off: Int) -> XzRange []
+    normalized(r, src, off)
 
 // Decode `n` bits with no probability model at all, at exactly one bit
 // each.
@@ -174,7 +335,15 @@ pub fn decode_bit(r: XzRange, prob: Int, src: Bytes, off: Int) -> XzRangeStep []
 //     println("${s.bit}")
 // ```
 pub fn decode_direct(r: XzRange, n: Int, src: Bytes, off: Int) -> XzRangeStep []
-    todo("xz-nv.xzrange.decode_direct")
+    var coder = r
+    var symbol = 0
+    var k = 0
+    while k < n and coder.ok
+        let step = direct_step(coder, src, off)
+        coder = step.coder
+        symbol = symbol * 2 + step.bit
+        k = k + 1
+    XzRangeStep { coder: coder, bit: symbol, prob: 0 }
 
 // Decode a bit tree of `n` levels: `n` bit decodes against `2^n`
 // probabilities, answering the symbol.
@@ -193,9 +362,9 @@ pub fn decode_direct(r: XzRange, n: Int, src: Bytes, off: Int) -> XzRangeStep []
 //                                 bytes.zeros(64), 0, bytes.zeros(16), 0)
 //     println("${s.bit}")
 // ```
-pub fn decode_tree(r: XzRange, n: Int, probs: Bytes, at: Int, src: Bytes,
+pub fn decode_tree(r: XzRange, n: Int, var probs: Bytes, at: Int, src: Bytes,
                    off: Int) -> XzRangeStep []
-    todo("xz-nv.xzrange.decode_tree")
+    tree_step(r, n, var probs, at, src, off, true)
 
 // The same tree, read in reverse bit order.
 //
@@ -212,9 +381,9 @@ pub fn decode_tree(r: XzRange, n: Int, probs: Bytes, at: Int, src: Bytes,
 //                                         bytes.zeros(64), 0, bytes.zeros(16), 0)
 //     println("${s.bit}")
 // ```
-pub fn decode_tree_reverse(r: XzRange, n: Int, probs: Bytes, at: Int, src: Bytes,
+pub fn decode_tree_reverse(r: XzRange, n: Int, var probs: Bytes, at: Int, src: Bytes,
                            off: Int) -> XzRangeStep []
-    todo("xz-nv.xzrange.decode_tree_reverse")
+    tree_step(r, n, var probs, at, src, off, false)
 
 // A probability adapted towards a bit, without decoding anything.
 //
@@ -229,7 +398,11 @@ pub fn decode_tree_reverse(r: XzRange, n: Int, probs: Bytes, at: Int, src: Bytes
 //     println("${xzrange.adapt(xzrange.XZ_PROB_INIT, 0)}")
 // ```
 pub fn adapt(prob: Int, bit: Int) -> Int []
-    todo("xz-nv.xzrange.adapt")
+    if bit == 0
+        // Towards certainty of zero: up to but never reaching 2048.
+        prob + ((XZ_PROB_INIT * 2 - prob) >> XZ_PROB_MOVE_BITS)
+    else
+        prob - (prob >> XZ_PROB_MOVE_BITS)
 
 // Whether a finished coder is in the state a well-formed stream leaves
 // it in: `code` exactly zero.
@@ -247,7 +420,7 @@ pub fn adapt(prob: Int, bit: Int) -> Int []
 //     println("${xzrange.is_clean(xzrange.start(bytes.zeros(5), 0))}")
 // ```
 pub fn is_clean(r: XzRange) -> Bool []
-    todo("xz-nv.xzrange.is_clean")
+    r.ok and r.code == 0
 
 // How many bytes of the source a coder has consumed.
 //
@@ -259,4 +432,4 @@ pub fn is_clean(r: XzRange) -> Bool []
 //     println("${xzrange.consumed_of(xzrange.start(bytes.zeros(5), 0))}")
 // ```
 pub fn consumed_of(r: XzRange) -> Int []
-    todo("xz-nv.xzrange.consumed_of")
+    r.consumed

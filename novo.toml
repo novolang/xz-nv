@@ -1,15 +1,14 @@
 [package]
 name        = "xz-nv"
-version     = "0.0.1"
-description = "xz and LZMA2, decoder first, with nothing performed: a feed-and-drain decoder over the whole container — the stream header and footer with their duplicated flags, block headers and their optional binding sizes, the index that makes an .xz seekable, and CRC-32, CRC-64 and SHA-256 as the integrity checks — over LZMA2's chunk layer, LZMA1's range coder and twelve-state context model, the delta filter and all eight branch converters, and the legacy .lzma container read.  The dictionary and the probability array are the caller's, sized from the block header before anything is committed.  The encoder is declared single-threaded with a greedy match finder, and the README says so rather than implying otherwise.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "xz and LZMA2, decoder first, with nothing performed: a feed-and-drain decoder over the whole container — the stream header and footer with their duplicated flags, block headers and their optional binding sizes, the index that makes an .xz seekable, and CRC-32, CRC-64 and SHA-256 as the integrity checks — over LZMA2's chunk layer, LZMA1's range coder and twelve-state context model, the delta filter and all eight branch converters, and the legacy .lzma container read.  The dictionary and the probability array are the caller's, sized from the block header before anything is committed.  The encoder is single-threaded with a greedy match finder, and both the module comment and the README say so rather than implying otherwise."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# Implemented, and newer than the format it speaks: the whole container
+# is read and written, and the encoder's ratio and its memory ceiling
+# are still moving.  See the CHANGELOG's `### Known` for what that
+# means in practice.
+stability   = "experimental"
 
 # `core`.  An LZMA decoder is a range coder, a probability array and a
 # dictionary — arithmetic over bytes the caller already holds.  Nothing
@@ -37,7 +36,7 @@ category    = "compression"
 tags        = ["xz", "lzma", "lzma2", "compression", "decompression", "bcj", "delta", "sans-io"]
 repository  = "https://github.com/novolang/xz-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.9.0"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -54,7 +53,7 @@ novo        = ">= 0.9.0"
 #
 # (bzip2's CRC is the UNREFLECTED variant of the same polynomial and
 # cannot use this.  That package owns its own and says why.)
-crc-nv = "^0.1"
+crc-nv = "^0.1.6"
 
 # crypto-nv, for the SHA-256 an `.xz` block may carry as its integrity
 # check — what `xz --check=sha256` writes.
@@ -69,4 +68,4 @@ crc-nv = "^0.1"
 # The third check the format defines, CRC-64/XZ, has no row on the
 # registry at all — crc-nv 0.1.4 publishes no 64-bit algorithm — so
 # `xzcheck` owns it, with its catalogue check value asserted.
-crypto-nv = "^0.1"
+crypto-nv = "^0.1.7"

@@ -1,9 +1,6 @@
 // xzerror.nv — one fault type over two containers and three coders,
 // and the four questions that partition it.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
-//
 // A POSITION NAMES THE LAYER IT WAS FOUND IN.  An `.xz` file is a
 // container holding blocks, each of which holds a filter chain, at the
 // end of which is an LZMA2 stream made of chunks holding LZMA1 symbols.
@@ -72,7 +69,7 @@ pub const XZ_LAYER_CHECK = 6
 //     println("${xzerror.here(-1, 0, xzerror.XZ_LAYER_STREAM).offset}")
 // ```
 pub fn here(block: Int, offset: Int, layer: Int) -> XzWhere []
-    todo("xz-nv.xzerror.here")
+    XzWhere { block: block, offset: offset, layer: layer }
 
 // A short, stable name for a layer: `"stream"`, `"block"`, `"index"`,
 // `"filter"`, `"lzma2"`, `"lzma"`, `"check"`.
@@ -84,7 +81,15 @@ pub fn here(block: Int, offset: Int, layer: Int) -> XzWhere []
 //     println(xzerror.layer_name(xzerror.XZ_LAYER_LZMA2))
 // ```
 pub fn layer_name(layer: Int) -> Str []
-    todo("xz-nv.xzerror.layer_name")
+    match layer
+        XZ_LAYER_STREAM => "stream"
+        XZ_LAYER_BLOCK  => "block"
+        XZ_LAYER_INDEX  => "index"
+        XZ_LAYER_FILTER => "filter"
+        XZ_LAYER_LZMA2  => "lzma2"
+        XZ_LAYER_LZMA   => "lzma"
+        XZ_LAYER_CHECK  => "check"
+        _               => "unknown"
 
 // Why an `.xz` or `.lzma` stream could not be decoded.
 //
@@ -239,7 +244,7 @@ impl Error for XzFault
     // than left for the caller to add, because a compressed stream has
     // no other landmark a person can navigate to.
     fn message(self) -> Str
-        todo("xz-nv.xzerror.XzFault.message")
+        describe(self)
 
 // A fault from a kind and a position.
 //
@@ -251,7 +256,7 @@ impl Error for XzFault
 //         xzerror.fault(XzBadFooterMagic, xzerror.here(-1, 40, 0)).kind))
 // ```
 pub fn fault(kind: XzFaultKind, at: XzWhere) -> XzFault []
-    todo("xz-nv.xzerror.fault")
+    XzFault { kind: kind, at: at }
 
 // A short, stable name for a kind: `"bad-magic"`, `"check-mismatch"`,
 // `"unsupported-filter"`.
@@ -267,7 +272,68 @@ pub fn fault(kind: XzFaultKind, at: XzWhere) -> XzFault []
 //     println(xzerror.kind_name(XzBadMagic))
 // ```
 pub fn kind_name(k: XzFaultKind) -> Str []
-    todo("xz-nv.xzerror.kind_name")
+    match k
+        XzBadMagic                => "bad-magic"
+        XzBadFooterMagic          => "bad-footer-magic"
+        XzHeaderCrcMismatch(_, _) => "header-crc-mismatch"
+        XzFlagsMismatch           => "flags-mismatch"
+        XzReservedBitSet(_)       => "reserved-bit-set"
+        XzUnsupportedCheck(_)     => "unsupported-check"
+        XzBadVli(_)               => "bad-vli"
+        XzBadBlockHeader(_)       => "bad-block-header"
+        XzUnsupportedFilter(_)    => "unsupported-filter"
+        XzBadFilterChain(_)       => "bad-filter-chain"
+        XzBadFilterProperties(_)  => "bad-filter-properties"
+        XzBadLzma2Chunk(_)        => "bad-lzma2-chunk"
+        XzLzma2NoDictionaryReset  => "lzma2-no-dictionary-reset"
+        XzBadLzmaProperties(_)    => "bad-lzma-properties"
+        XzDistanceTooFar(_, _)    => "distance-too-far"
+        XzBadRangeCoder(_)        => "bad-range-coder"
+        XzSizeMismatch(_, _)      => "size-mismatch"
+        XzCheckMismatch(_)        => "check-mismatch"
+        XzIndexMismatch(_)        => "index-mismatch"
+        XzBadBackwardSize(_)      => "bad-backward-size"
+        XzTrailingBytes(_)        => "trailing-bytes"
+        XzTruncated(_)            => "truncated"
+        XzLimitReached(_, _)      => "limit-reached"
+        XzBufferTooSmall(_, _)    => "buffer-too-small"
+        XzBadParameter(_)         => "bad-parameter"
+        XzSourceFailed            => "source-failed"
+
+// The one-clause reason for a kind, with every number the variant
+// carries in it.
+//
+// Split out of `describe` so that the position — the same three numbers
+// for every kind — is written once rather than in each of the
+// twenty-six sentences.
+fn reason(k: XzFaultKind) -> Str
+    match k
+        XzBadMagic                => "the stream does not begin with `FD 37 7A 58 5A 00`"
+        XzBadFooterMagic          => "the stream footer does not end with `YZ`"
+        XzHeaderCrcMismatch(d, c) => "the stream header's CRC-32 is ${d} and its two flag bytes give ${c}"
+        XzFlagsMismatch           => "the stream footer's flags are not the stream header's"
+        XzReservedBitSet(at)      => "a bit the format requires clear is set at ${at} in the field"
+        XzUnsupportedCheck(c)     => "the stream's check type is ${c}, which this package does not implement"
+        XzBadVli(at)              => "the multibyte integer at byte ${at} is not in the shortest form the format requires"
+        XzBadBlockHeader(at)      => "the block header at byte ${at} declares a size, a filter count or padding the format does not allow"
+        XzUnsupportedFilter(id)   => "the filter with ID ${id} is not one this package implements"
+        XzBadFilterChain(what)    => "the filter chain is not one the format allows: ${what}"
+        XzBadFilterProperties(id) => "the filter with ID ${id} was given properties it does not accept"
+        XzBadLzma2Chunk(c)        => "control byte ${c} is not an LZMA2 chunk"
+        XzLzma2NoDictionaryReset  => "an LZMA2 chunk referred to the dictionary before it had been reset"
+        XzBadLzmaProperties(got)  => "the LZMA properties byte ${got} encodes a model no decoder can build"
+        XzDistanceTooFar(d, a)    => "a match distance of ${d} reaches past the ${a} bytes available"
+        XzBadRangeCoder(at)       => "the range coder's invariant was broken at byte ${at}"
+        XzSizeMismatch(d, a)      => "the block declared ${d} bytes and gave ${a}"
+        XzCheckMismatch(c)        => "the block's check of type ${c} does not match its content"
+        XzIndexMismatch(what)     => "the index does not describe the blocks that were read: ${what}"
+        XzBadBackwardSize(d)      => "the stream footer's backward size is ${d}, which does not point at the index"
+        XzTrailingBytes(at)       => "byte ${at} follows the last stream footer and is neither padding nor a stream header"
+        XzTruncated(need)         => "the stream ended with ${need} more bytes needed to finish"
+        XzLimitReached(w, a)      => "the decoder wanted ${w} and the limit allows ${a}"
+        XzBufferTooSmall(w, h)    => "a buffer of ${h} bytes was handed ${w}"
+        XzBadParameter(what)      => "a parameter is outside what the function allows: ${what}"
+        XzSourceFailed            => "the source stream failed"
 
 // One English sentence saying what went wrong and where, with every
 // number the variant carries in it.
@@ -280,7 +346,7 @@ pub fn kind_name(k: XzFaultKind) -> Str []
 //         xzerror.fault(XzUnsupportedCheck(2), xzerror.here(-1, 7, 0))))
 // ```
 pub fn describe(f: XzFault) -> Str []
-    todo("xz-nv.xzerror.describe")
+    "${reason(f.kind)} at block ${f.at.block}, layer ${layer_name(f.at.layer)}, byte ${f.at.offset}"
 
 // Whether the stream is DAMAGED, as opposed to unfinished, over a
 // bound this program set, or asking for something this package does
@@ -293,7 +359,33 @@ pub fn describe(f: XzFault) -> Str []
 //     println("${xzerror.is_corrupt(XzBadFooterMagic)}")
 // ```
 pub fn is_corrupt(k: XzFaultKind) -> Bool []
-    todo("xz-nv.xzerror.is_corrupt")
+    match k
+        XzBadMagic                => true
+        XzBadFooterMagic          => true
+        XzHeaderCrcMismatch(_, _) => true
+        XzFlagsMismatch           => true
+        XzReservedBitSet(_)       => true
+        XzBadVli(_)               => true
+        XzBadBlockHeader(_)       => true
+        XzBadFilterChain(_)       => true
+        XzBadFilterProperties(_)  => true
+        XzBadLzma2Chunk(_)        => true
+        XzLzma2NoDictionaryReset  => true
+        XzBadLzmaProperties(_)    => true
+        XzDistanceTooFar(_, _)    => true
+        XzBadRangeCoder(_)        => true
+        XzSizeMismatch(_, _)      => true
+        XzCheckMismatch(_)        => true
+        XzIndexMismatch(_)        => true
+        XzBadBackwardSize(_)      => true
+        XzTrailingBytes(_)        => true
+        XzUnsupportedCheck(_)     => false
+        XzUnsupportedFilter(_)    => false
+        XzTruncated(_)            => false
+        XzLimitReached(_, _)      => false
+        XzBufferTooSmall(_, _)    => false
+        XzBadParameter(_)         => false
+        XzSourceFailed            => false
 
 // Whether the decoder simply has not been given enough bytes yet.
 //
@@ -307,7 +399,9 @@ pub fn is_corrupt(k: XzFaultKind) -> Bool []
 //     println("${xzerror.is_incomplete(XzTruncated(12))}")
 // ```
 pub fn is_incomplete(k: XzFaultKind) -> Bool []
-    todo("xz-nv.xzerror.is_incomplete")
+    match k
+        XzTruncated(_) => true
+        _              => false
 
 // Whether the fault is a bound this program chose rather than anything
 // about the data.
@@ -322,7 +416,10 @@ pub fn is_incomplete(k: XzFaultKind) -> Bool []
 //     println("${xzerror.is_limit(XzBufferTooSmall(65536, 4096))}")
 // ```
 pub fn is_limit(k: XzFaultKind) -> Bool []
-    todo("xz-nv.xzerror.is_limit")
+    match k
+        XzLimitReached(_, _)   => true
+        XzBufferTooSmall(_, _) => true
+        _                      => false
 
 // Whether the file is GOOD and asks for something this package does
 // not do.
@@ -340,4 +437,7 @@ pub fn is_limit(k: XzFaultKind) -> Bool []
 //     println("${xzerror.is_unsupported(XzUnsupportedFilter(0x20))}")
 // ```
 pub fn is_unsupported(k: XzFaultKind) -> Bool []
-    todo("xz-nv.xzerror.is_unsupported")
+    match k
+        XzUnsupportedCheck(_)  => true
+        XzUnsupportedFilter(_) => true
+        _                      => false

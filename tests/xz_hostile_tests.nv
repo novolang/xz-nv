@@ -1,0 +1,54 @@
+use std.bytes
+use std.test
+use xzstream
+use xzcheck
+use xzblock
+use xzfilter
+use xzdec
+
+// Inputs whose declared sizes are larger than anything the bytes behind
+// them could produce.  The decoder reserves memory from a block header
+// before it has seen a byte of the block, so the reservation has to be
+// bounded by what the caller allows and not by what the header claims.
+
+// A stream header followed by one block header that declares
+// `uncompressed` output bytes, and nothing after it.
+fn hostile_block(uncompressed: Int) -> Bytes []
+    let f = match xzfilter.lzma2(24)
+        Ok(f)  => f
+        Err(_) => XzFilter { id: xzfilter.XZ_FILTER_LZMA2, props: bytes.zeros(1) }
+    let flags = match xzstream.flags(xzcheck.XZ_CHECK_NONE)
+        Ok(x)  => x
+        Err(_) => XzStreamFlags { check: 0 }
+    let header = match xzblock.header_bytes(xzblock.header([f], -1, uncompressed))
+        Ok(b)  => b
+        Err(_) => bytes.zeros(0)
+    xzstream.header_bytes(flags) + header
+
+@test
+fn test_a_declared_terabyte_does_not_reserve_a_terabyte_under_a_limit() [io]
+    let hostile = hostile_block(1099511627776)
+    let (d, _) = xzdec.feed(xzdec.with_limit(xzdec.decoder(), 1024), hostile)
+    // Reaching this line is the assertion: the reservation used to abort
+    // the process.  The decoder is still waiting for the block body.
+    test.assert(xzdec.error(d) == None)
+    test.assert(xzdec.total_in(d) == bytes.len(hostile))
+
+@test
+fn test_a_declared_terabyte_does_not_reserve_a_terabyte_under_the_default_limits() [io]
+    let (d, _) = xzdec.feed(xzdec.decoder(), hostile_block(1099511627776))
+    test.assert(xzdec.error(d) == None)
+
+@test
+fn test_a_declared_size_under_the_limit_is_still_honoured() [io]
+    let (d, _) = xzdec.feed(xzdec.with_limit(xzdec.decoder(), 1048576), hostile_block(100000))
+    test.assert(xzdec.error(d) == None)
+
+@test
+fn test_a_single_block_with_a_declared_terabyte_is_refused_not_reserved() [io]
+    // The block header alone, with no body behind it.
+    let all = hostile_block(1099511627776)
+    let block = bytes.slice(all, 12, bytes.len(all))
+    match xzdec.decompress_block(block, 0, -1)
+        Ok(_)  => test.fail("a block with no body decoded")
+        Err(_) => test.assert(true)
