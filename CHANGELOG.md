@@ -171,6 +171,8 @@ every stream the package's encoder writes.
   0.0.1 recorded: a `@value` struct cannot be a `Result` payload in v1
   and each sits in a loop that runs millions of times per megabyte.
 
+This release requires novo 0.23.0 or later.
+
 ## [0.0.1] — 2026-09-17
 
 **The interface, published before anyone implements it.** Every public
